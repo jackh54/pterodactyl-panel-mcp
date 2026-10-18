@@ -13,7 +13,7 @@ INSTANCE = os.environ.get('PANEL_DIR', os.path.expanduser('~/Documents/GitHub/_v
 PHP = os.environ.get('PHP', 'php')
 SQL = os.environ.get('MYSQL_CMD', 'docker --context orbstack exec -i v2dev-mariadb mariadb -uroot -pdevroot panel_mcp').split()
 JAR = os.environ.get('TEST_JAR', os.path.join(HERE, 'fixtures', 'TestPlugin.jar'))
-T = os.environ.get('PANEL_MCP_TABLE_PREFIX', 'ext_panel_mcp_')
+TP = os.environ.get('PANEL_MCP_TABLE_PREFIX', 'ext_panel_mcp_')
 # Admin-only read tools other installed extensions add (comma separated), e.g. EXTRA_ADMIN_READ_TOOLS=get_health.
 EXTRA = [x for x in os.environ.get('EXTRA_ADMIN_READ_TOOLS', '').split(',') if x]
 FIXTURE_TOOLS = ['fixture_echo']  # added by fixtures/extension (the ProvidesTools tag)
@@ -36,7 +36,10 @@ def check(name, cond, extra=''):
 
 
 def sql(statement):
-    return subprocess.run(SQL, input=statement, capture_output=True, text=True, check=True).stdout
+    r = subprocess.run(SQL, input=statement, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f'SQL failed ({r.returncode}): {statement[:200]}\n{r.stderr[-1000:]}')
+    return r.stdout
 
 
 def artisan(*args, **kw):
@@ -205,8 +208,8 @@ r = token(cid, v, code, red); t = r.json()
 check('token issued', r.status_code == 200 and t['scope'] == 'panel:read panel:control panel:write' and t['token_type'] == 'Bearer' and t['expires_in'] == 3600
       and t['access_token'].startswith('lmcp_') and r.headers.get('Cache-Control', '').startswith('no-store') and r.headers.get('Pragma') == 'no-cache' and 'Set-Cookie' not in r.headers, (r.text, dict(r.headers)))
 A = t['access_token']
-stored = sql(f"SELECT COUNT(*) FROM {T}oauth_tokens WHERE access_hash = SHA2('{A}', 256) AND refresh_hash = SHA2('{t['refresh_token']}', 256);").split()
-check('only SHA-256 hashes stored', stored[-1] == '1' and A not in sql(f'SELECT access_hash, refresh_hash FROM {T}oauth_tokens;'), stored)
+stored = sql(f"SELECT COUNT(*) FROM {TP}oauth_tokens WHERE access_hash = SHA2('{A}', 256) AND refresh_hash = SHA2('{t['refresh_token']}', 256);").split()
+check('only SHA-256 hashes stored', stored[-1] == '1' and A not in sql(f'SELECT access_hash, refresh_hash FROM {TP}oauth_tokens;'), stored)
 r2 = token(cid, v, code, red); check('code replay refused', r2.status_code == 400)
 check('code replay revoked the connection', rpc(A, 'ping').status_code == 401)
 s, cid, v, code, red, *_ = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
@@ -419,7 +422,7 @@ check('upload token claims', claims['server_uuid'] == SMP and claims['scope'] ==
 e, x = tool(V, 'inspect_archive', server='SMP', path='/plugins/TestPlugin.jar'); check('archive listing + plugin.yml', not e and 'main: com.example.test.TestPlugin' in x and 'com/example/test/TestPlugin.class' in x, x)
 e, x = tool(V, 'inspect_archive', server='SMP', path='/plugins/TestPlugin.jar', entry='plugin.yml'); check('archive text entry', not e and 'api-version' in x, x)
 e, x = tool(V, 'inspect_archive', server='SMP', path='/plugins/TestPlugin.jar', entry='com/example/test/TestPlugin.class')
-check('class outline', not e and 'public class com.example.test.TestPlugin implements Runnable' in x and 'public static boolean check(String, long, double[])' in x and 'protected int[] counts' in x and 'java.util.List names' in x and 'public TestPlugin()' in x and '"drillcancel.use"' in x and 'Enabling TestPlugin v1.0' in x, x)
+check('class outline', not e and 'public class com.example.test.TestPlugin implements Runnable' in x and 'public static boolean check(String, long, double[])' in x and 'protected int[] counts' in x and 'java.util.List names' in x and 'public TestPlugin()' in x and '"testplugin.use"' in x and 'Enabling TestPlugin v1.0' in x, x)
 e, x = tool(V, 'inspect_archive', server='SMP', path='/plugins/TestPlugin.jar', entry='nope.yml'); check('archive missing entry', e, x)
 e, x = tool(V, 'inspect_archive', server='SMP', path='/server.properties'); check('not an archive', e and 'not a zip' in x, x)
 e, x = tool(V, 'inspect_archive', server='SMP', path='/plugins/missing.jar'); check('missing archive -> clean error', e and 'not found' in x.lower(), x)
@@ -560,10 +563,10 @@ check('old access token dead after refresh', rpc(A, 'ping').status_code == 401)
 r_ = rpc(nt['access_token'], 'ping'); check('new access token works', r_.status_code == 200, r_.status_code)
 check('refresh with wrong client refused', post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id='x', refresh_token=nt['refresh_token'])).status_code == 400)
 check('old refresh reuse refused (within grace: connection kept)', post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id=cid, refresh_token=t['refresh_token'])).status_code == 400 and rpc(nt['access_token'], 'ping').status_code == 200)
-sql(f"UPDATE {T}oauth_tokens SET rotated_at = NOW() - INTERVAL 2 MINUTE WHERE rotated_at IS NOT NULL;")
+sql(f"UPDATE {TP}oauth_tokens SET rotated_at = NOW() - INTERVAL 2 MINUTE WHERE rotated_at IS NOT NULL;")
 check('old refresh reuse after the grace -> refused', post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id=cid, refresh_token=t['refresh_token'])).status_code == 400)
 check('... and the whole connection is revoked', rpc(nt['access_token'], 'ping').status_code == 401)
-sql(f"UPDATE {T}oauth_tokens SET access_expires_at = NOW() - INTERVAL 1 SECOND WHERE access_hash = SHA2('%s', 256);" % V)
+sql(f"UPDATE {TP}oauth_tokens SET access_expires_at = NOW() - INTERVAL 1 SECOND WHERE access_hash = SHA2('%s', 256);" % V)
 check('expired access token -> 401', rpc(V, 'ping').status_code == 401)
 pg = s2.get(B + '/oauth/connections'); check('connections page lists app', pg.status_code == 200 and 'Remove' in pg.text and 'Test bAppb' in pg.text and B + '/mcp' in pg.text and pg.headers.get('Cache-Control', '').startswith('no-store'))
 check('connections page shows granted access', 'Change files and settings' in pg.text and 'Read' in pg.text)
@@ -580,14 +583,14 @@ post(B + '/oauth/revoke', data={'token': S}); check('revocation endpoint', rpc(S
 check('anonymous connections page -> login', requests.get(B + '/oauth/connections', allow_redirects=False).headers.get('Location') == B + '/auth/login')
 
 print('== grant cap and cleanup')
-before = int(sql(f"SELECT COUNT(*) FROM {T}oauth_grants WHERE user_id = {ADMIN['id']} AND revoked_at IS NULL;").split()[-1])
+before = int(sql(f"SELECT COUNT(*) FROM {TP}oauth_grants WHERE user_id = {ADMIN['id']} AND revoked_at IS NULL;").split()[-1])
 for _ in range(max(0, 21 - before)):
     connect(ADMIN, [])
-active = int(sql(f"SELECT COUNT(*) FROM {T}oauth_grants WHERE user_id = {ADMIN['id']} AND revoked_at IS NULL;").split()[-1])
+active = int(sql(f"SELECT COUNT(*) FROM {TP}oauth_grants WHERE user_id = {ADMIN['id']} AND revoked_at IS NULL;").split()[-1])
 check('at most 20 active connections per user', active == 20, active)
-sql(f"UPDATE {T}oauth_codes SET expires_at = NOW() - INTERVAL 1 SECOND;")
+sql(f"UPDATE {TP}oauth_codes SET expires_at = NOW() - INTERVAL 1 SECOND;")
 s6, cid6, v6, code6, red6, *_ = connect(ADMIN, [])
-sql(f"UPDATE {T}oauth_codes SET expires_at = NOW() - INTERVAL 1 SECOND;")
+sql(f"UPDATE {TP}oauth_codes SET expires_at = NOW() - INTERVAL 1 SECOND;")
 check('expired code refused', token(cid6, v6, code6, red6).status_code == 400)
 
 print('== activity reads as if the user did it')
