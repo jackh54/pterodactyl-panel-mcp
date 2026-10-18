@@ -1,0 +1,10 @@
+{
+    "id": "pmcp-fixture",
+    "name": "Panel MCP test fixture",
+    "version": "1.0.0",
+    "requires": { "panel": "^2.0.0-dev", "php": "^8.3" },
+    "description": "Test-only: adds one MCP tool through the ProvidesTools tag (and one malformed tool that must be left out).",
+    "author": "Panel MCP tests",
+    "provider": "PanelMcpFixture\\FixtureProvider",
+    "autoload": { "PanelMcpFixture\\": "src" }
+}

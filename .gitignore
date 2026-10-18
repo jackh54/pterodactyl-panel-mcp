@@ -1,0 +1,9 @@
+/dist/
+/node_modules/
+/vendor/
+/.sdk/
+/tests/e2e/.state.json
+/tests/e2e/fixtures/TestPlugin.jar
+__pycache__/
+*.pteroext
+.DS_Store

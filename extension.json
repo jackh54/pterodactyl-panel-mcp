@@ -1,0 +1,25 @@
+{
+    "$schema": "./node_modules/@pterodactyl/sdk/manifest.schema.json",
+    "id": "panel-mcp",
+    "name": "Panel MCP",
+    "version": "1.0.0",
+    "requires": {
+        "panel": "^2.0.0-dev",
+        "sdk": "^2.0.0-beta.4",
+        "php": "^8.3"
+    },
+    "description": "An MCP server inside the panel: AI assistants manage servers, files, schedules and consoles as the signed-in user, over OAuth 2.1.",
+    "author": "PandaScript",
+    "provider": "PanelMcp\\PanelMcpProvider",
+    "autoload": {
+        "PanelMcp\\": "src"
+    },
+    "routes": {
+        "root": ["mcp", "oauth"]
+    },
+    "ui": {
+        "entry": "dist/client.js",
+        "mode": "native",
+        "prefix": "pmcp"
+    }
+}
