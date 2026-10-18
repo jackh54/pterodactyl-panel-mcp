@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="1200" height="520" font-family="Inter, 'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0d0d18"/><stop offset="1" stop-color="#0a1820"/></linearGradient>
+    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8b8ba3"/></marker>
+  </defs>
+  <rect width="1200" height="520" rx="24" fill="url(#bg)"/>
+
+  <!-- column 1: AI client -->
+  <g transform="translate(40 150)">
+    <rect width="230" height="220" rx="18" fill="#16162a" stroke="#a78bfa" stroke-opacity=".55"/>
+    <text x="115" y="44" text-anchor="middle" font-size="20" font-weight="700" fill="#fafafa">AI client</text>
+    <text x="115" y="70" text-anchor="middle" font-size="14" fill="#9d9db5">any remote MCP client</text>
+    <g font-size="15" fill="#e4e4f0" text-anchor="middle">
+      <rect x="35" y="94" width="160" height="32" rx="16" fill="#ffffff" fill-opacity=".06"/><text x="115" y="115">Claude</text>
+      <rect x="35" y="134" width="160" height="32" rx="16" fill="#ffffff" fill-opacity=".06"/><text x="115" y="155">ChatGPT</text>
+      <rect x="35" y="174" width="160" height="32" rx="16" fill="#ffffff" fill-opacity=".06"/><text x="115" y="195">Cursor · VS Code</text>
+    </g>
+  </g>
+
+  <!-- column 2: the extension inside the panel -->
+  <g transform="translate(370 40)">
+    <rect width="470" height="440" rx="20" fill="#121224" stroke="url(#ac)" stroke-width="2"/>
+    <text x="235" y="40" text-anchor="middle" font-size="20" font-weight="700" fill="#fafafa">Pterodactyl panel + <tspan fill="url(#ac)">Panel MCP</tspan></text>
+
+    <g transform="translate(30 66)">
+      <rect width="410" height="96" rx="14" fill="#1b1b33"/>
+      <text x="20" y="32" font-size="16" font-weight="700" fill="#c4b5fd">① Sign in &amp; approve</text>
+      <text x="20" y="56" font-size="14" fill="#b4b4c8">/oauth/authorize · your normal panel login, 2FA, passkeys</text>
+      <text x="20" y="78" font-size="14" fill="#b4b4c8">You tick Read / Control / Change files</text>
+    </g>
+    <g transform="translate(30 176)">
+      <rect width="410" height="96" rx="14" fill="#1b1b33"/>
+      <text x="20" y="32" font-size="16" font-weight="700" fill="#a5f3fc">② Tokens (OAuth 2.1)</text>
+      <text x="20" y="56" font-size="14" fill="#b4b4c8">PKCE S256 · 1 h access · rotating 30-day refresh</text>
+      <text x="20" y="78" font-size="14" fill="#b4b4c8">Only SHA-256 hashes stored · revoke any time</text>
+    </g>
+    <g transform="translate(30 286)">
+      <rect width="410" height="124" rx="14" fill="#1b1b33"/>
+      <text x="20" y="32" font-size="16" font-weight="700" fill="#86efac">③ Tool call on /mcp</text>
+      <text x="20" y="56" font-size="14" fill="#b4b4c8">scope the user granted?  ✓</text>
+      <text x="20" y="78" font-size="14" fill="#b4b4c8">same panel permission as the API endpoint?  ✓</text>
+      <text x="20" y="100" font-size="14" fill="#b4b4c8">runs the panel's own action, logged as the user</text>
+    </g>
+  </g>
+
+  <!-- column 3: servers -->
+  <g transform="translate(940 150)">
+    <rect width="220" height="220" rx="18" fill="#0f1d24" stroke="#22d3ee" stroke-opacity=".55"/>
+    <text x="110" y="44" text-anchor="middle" font-size="20" font-weight="700" fill="#fafafa">Wings</text>
+    <text x="110" y="70" text-anchor="middle" font-size="14" fill="#9d9db5">your game servers</text>
+    <g transform="translate(40 94)">
+      <rect width="140" height="30" rx="8" fill="#ffffff" fill-opacity=".07"/><circle cx="16" cy="15" r="5" fill="#34d399"/><text x="32" y="20" font-size="14" fill="#e4e4f0">survival</text>
+      <rect y="40" width="140" height="30" rx="8" fill="#ffffff" fill-opacity=".07"/><circle cx="16" cy="55" r="5" fill="#34d399"/><text x="32" y="60" font-size="14" fill="#e4e4f0">lobby</text>
+      <rect y="80" width="140" height="30" rx="8" fill="#ffffff" fill-opacity=".07"/><circle cx="16" cy="95" r="5" fill="#fbbf24"/><text x="32" y="100" font-size="14" fill="#e4e4f0">events</text>
+    </g>
+  </g>
+
+  <!-- arrows -->
+  <g stroke="#8b8ba3" stroke-width="2" fill="none" marker-end="url(#ar)">
+    <path d="M270 200 C 320 200, 330 154, 398 154"/>
+    <path d="M398 266 C 330 266, 320 260, 272 260" />
+    <path d="M270 320 C 320 320, 330 386, 398 386"/>
+    <path d="M812 390 C 870 390, 880 260, 938 260"/>
+  </g>
+  <g font-size="12.5" fill="#9d9db5">
+    <text x="286" y="168">connect</text>
+    <text x="292" y="283">token</text>
+    <text x="286" y="378">tools/call</text>
+    <text x="866" y="236">Wings API</text>
+  </g>
+</svg>

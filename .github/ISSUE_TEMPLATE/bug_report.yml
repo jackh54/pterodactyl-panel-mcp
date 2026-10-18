@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in Panel MCP doesn't work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security problems go to [private reporting](https://github.com/jackh54/pterodactyl-panel-mcp/security/advisories/new), not here.**
+        Please remove tokens, passwords and private addresses from anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: tool
+    attributes:
+      label: Tool or page
+      placeholder: e.g. edit_file, the consent page, /oauth/token
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: e.g. Claude (web), Claude Code 2.x, Cursor 1.x
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: Panel MCP 1.0.0, panel 2.0-develop @ abc1234, PHP 8.3
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The tool's error text, and lines from storage/logs/laravel-*.log around the time (search for "Panel MCP" or "panel_mcp_tool").
+      render: text

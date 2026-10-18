@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1' # weekly: catch upstream 2.0-develop changes that break the build
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: PHP lint (8.3 and 8.4)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+      - name: php -l every file
+        run: find . -name '*.php' -not -path './node_modules/*' -print0 | xargs -0 -n1 php -l > /dev/null
+
+  frontend:
+    name: Build, typecheck and test against upstream 2.0-develop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: pterodactyl/panel
+          ref: 2.0-develop
+          path: .panel
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pack the panel's SDK
+        working-directory: .panel
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npm run sdk:testing || true
+          mkdir -p ../.sdk
+          (cd packages/sdk && npm pack --pack-destination ../../../.sdk)
+          mv ../.sdk/pterodactyl-sdk-*.tgz ../.sdk/pterodactyl-sdk.tgz
+      - name: Install (SDK from the panel, not the lock file)
+        run: |
+          node -e 'const f=require("fs");const l=JSON.parse(f.readFileSync("package-lock.json"));delete l.packages["node_modules/@pterodactyl/sdk"];f.writeFileSync("package-lock.json",JSON.stringify(l,null,4)+"\n")'
+          npm install --no-audit --no-fund --legacy-peer-deps
+      - run: npm run build
+      - run: npx tsc
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
