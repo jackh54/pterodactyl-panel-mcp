@@ -107,20 +107,23 @@ The client opens your panel, you sign in (if you aren't already) and approve. Co
 
 ## 🧰 Tools
 
-33 built-in tools. Each one needs the scope shown **and** the panel permission the equivalent API endpoint requires. Admin tools only exist for root administrators; nobody else even sees them listed.
+50 built-in tools. Each one needs the scope shown **and** the panel permission the equivalent API endpoint requires. Admin tools only exist for root administrators; nobody else even sees them listed.
 
 <table>
-<tr><th>Read</th><th>Control</th><th>Change files and settings</th></tr>
+<tr><th>Read</th><th>Control</th></tr>
 <tr valign="top"><td>
 
 `list_servers` · servers you can see, with live state<br>
-`get_server` · details, limits, allocations, variables<br>
+`get_server` · details, limits, allocations, variables, image choices<br>
 `get_console` · recent console output<br>
 `wait_for_console` · wait for a line (e.g. `Done (`)<br>
 `list_files` · `read_file` · `search_files`<br>
 `download_file` · any file, base64 or a link<br>
 `inspect_archive` · look inside a jar/zip, read `plugin.yml`, outline a `.class`<br>
 `list_schedules` · `get_activity`<br>
+`list_backups` · `download_backup` · a short-lived link<br>
+`list_allocations` · ports and their notes<br>
+`list_databases` · passwords only with Manage access<br>
 `get_ops_guide` 🛡️ · your team's runbook<br>
 `query_database` 🛡️ · read-only SQL
 
@@ -128,9 +131,12 @@ The client opens your panel, you sign in (if you aren't already) and approve. Co
 
 `power_action` · start, stop, restart, kill<br>
 `send_command` · run a console command and return the new output<br>
-`run_schedule` · trigger a schedule now
+`run_schedule` · trigger a schedule now<br>
+`create_backup` · with a name, lock and ignore patterns
 
-</td><td>
+</td></tr>
+<tr><th>Change files and settings</th><th>Manage backups, ports and databases</th></tr>
+<tr valign="top"><td>
 
 `edit_file` · exact search-and-replace edits<br>
 `write_file` · `create_folder`<br>
@@ -139,15 +145,26 @@ The client opens your panel, you sign in (if you aren't already) and approve. Co
 `pull_file` · download a URL to the server<br>
 `upload_file` · any file up to 4 MB<br>
 `create_upload_link` · for bigger files<br>
-`set_startup_variable`<br>
+`set_startup_variable` · `set_docker_image`<br>
 `save_schedule` · `delete_schedule`<br>
 `save_schedule_task` · `delete_schedule_task`<br>
 `update_server_config` 🛡️ · limits, startup, image
+
+</td><td>
+
+`restore_backup` · over the files, or onto a clean server<br>
+`delete_backup` · `set_backup_lock`<br>
+`add_allocation` · `update_allocation` · `remove_allocation`<br>
+`create_database` · returns the details for a plugin config<br>
+`rotate_database_password` · `delete_database`<br>
+`rename_server` · `reinstall_server`
 
 </td></tr>
 </table>
 
 🛡️ = root administrators only. `query_database` exists only when you configure a read-only database account; `get_ops_guide` answers once you install a guide.
+
+**Manage backups, ports and databases** arrived in 1.1. Connections approved before that don't have it: remove the app under Connected Apps and connect again to tick the box. On panel builds older than an action a tool needs, that tool is simply not listed.
 
 Every client also receives short **instructions** when it connects: read before changing, confirm before restarts or deletes, never run a plugin's reload command, never echo secrets. Add your own house rules under **Admin → Extensions → Panel MCP**.
 
@@ -160,8 +177,8 @@ Panel MCP was written to be safe to point an AI at a production network.
 | **Authorization** | OAuth 2.1 with mandatory PKCE (S256), exact redirect URI matching, RFC 8707 `resource` checks, dynamic client registration for public clients only. |
 | **Consent** | Only from a real panel session (password + 2FA or passkey), CSRF protected, single use, and it names the site you will be sent back to, because client names are self-chosen. |
 | **Tokens** | Random, stored only as SHA-256 hashes, bound to one connection. Codes live 2 minutes and work once; reusing a code revokes the connection. Refresh tokens rotate, and replaying an old one after a short retry window revokes the connection. |
-| **Permissions** | A scope can only narrow what your account can already do. Tools run the panel's own permission checks for the server and action, and refuse suspended servers. The panel's "require 2FA" setting applies to MCP connections too. |
-| **Isolation** | `/mcp` takes bearer tokens only: no cookies, no session, no CSRF surface, so a signed-in browser tab can't drive it. Per-connection rate limit (120 requests/minute by default). |
+| **Permissions** | A scope can only narrow what your account can already do. Tools run the panel's own permission checks for the server and action, and refuse suspended servers. The panel's "require 2FA" setting applies to MCP connections too. Database passwords are only returned to connections with Manage access, for accounts the panel would show them to. |
+| **Isolation** | `/mcp` takes bearer tokens only: no cookies, no session, no CSRF surface, so a signed-in browser tab can't drive it. Per-connection rate limit (120 requests/minute by default). Backup restores, new ports and new databases also count against the panel's own per-server limits, shared with clicks in the panel. |
 | **Audit** | Every change is written to the activity log as the user who connected; a connection email goes to the account owner; connections and removals are logged too. |
 | **Files** | Path traversal is refused; uploads report size and SHA-256; overwrites need an explicit `overwrite: true`; request bodies are read raw so file contents are never altered by input middleware. |
 | **SQL** | `query_database` uses a separate database account you create with SELECT only, plus a statement filter, a read-only transaction and a 15-second limit. Point it at game or plugin databases, never at the panel's own. |
@@ -242,16 +259,17 @@ class NetworkTools implements ProvidesTools
 $this->app->tag([NetworkTools::class], 'panel-mcp.tools');
 ```
 
-Tagging only stores the class name, so your extension keeps working when Panel MCP isn't installed. Built-in tool names always win, malformed tools are skipped and logged, and your tool does its own permission checks (throw `PanelMcp\ToolException` to return an error).
+Tagging only stores the class name, so your extension keeps working when Panel MCP isn't installed. Built-in tool names win (unless this panel build can't offer that built-in), malformed tools are skipped and logged, and your tool does its own permission checks (throw `PanelMcp\ToolException` to return an error).
 
 ## 🧪 Development
 
 ```bash
 npm install && npm run build   # frontend (Connected Apps card)
 npm test && npx tsc            # unit tests and types
+php tests/upstream-classes.php ../panel   # every panel class the extension uses still exists
 ```
 
-`tests/e2e` holds an end-to-end suite of about 300 checks that drives the OAuth flow and every tool over real HTTP against a **local** dev panel with a fake Wings node. See [tests/e2e/README.md](tests/e2e/README.md).
+`tests/e2e` holds an end-to-end suite of about 530 checks that drives the OAuth flow and every tool over real HTTP against a **local** dev panel with a fake Wings node. See [tests/e2e/README.md](tests/e2e/README.md).
 
 ## 📄 License
 

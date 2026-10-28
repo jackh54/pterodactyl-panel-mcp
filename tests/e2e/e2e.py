@@ -1,7 +1,7 @@
 # End-to-end test of the Panel MCP server + OAuth server on a LOCAL Pterodactyl v2 dev instance.
 # Never point this at production: it creates connections, writes files through the fake Wings node,
 # and changes server limits and schedules. See README.md for setup; run.sh does all of it.
-import base64, hashlib, hmac, json, os, re, secrets, struct, subprocess, sys, threading, time
+import base64, glob, hashlib, hmac, json, os, re, secrets, struct, subprocess, sys, threading, time
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
@@ -23,6 +23,11 @@ W = 'http://127.0.0.1:8081'
 ADMIN, STAFF, TOTP = STATE['users']['admin'], STATE['users']['staff'], STATE['users']['totp']
 SECRET_UUID = STATE['servers']['Secret']['uuid']
 SMP = STATE['servers']['SMP']['uuid']
+HUB, HUB_PK, SECRET_PK, SMP_PK = STATE['servers']['Hub-01']['uuid'], STATE['servers']['Hub-01']['pk'], STATE['servers']['Secret']['pk'], STATE['servers']['SMP']['pk']
+DB_HOST = STATE['database_host']  # the fixture database host: the test MariaDB itself
+THREE = ['panel:read', 'panel:control', 'panel:write']  # what connections made before panel:manage existed hold
+ALL = THREE + ['panel:manage']
+BUILTIN_TOOLS = 50  # all built-in tools, for an admin holding every scope
 
 ok = fail = 0
 
@@ -44,6 +49,30 @@ def sql(statement):
 
 def artisan(*args, **kw):
     return subprocess.Popen([PHP, '-d', 'error_reporting=0', 'artisan', *args], cwd=INSTANCE, **kw)
+
+
+def wings_calls(server):
+    """The backup and reinstall requests the panel sent to the fake node for a server (fakewings.py)."""
+    return requests.get(W + '/_calls', params={'server': server}).json()
+
+
+def game_login(user, password, database):
+    """Opens a real connection to the database host as an account the panel made and creates a table: 'ok', or the error."""
+    code = 'try { $p = new PDO("mysql:host=$argv[1];port=$argv[2];dbname=$argv[5]", $argv[3], $argv[4]); $p->exec("CREATE TABLE IF NOT EXISTS t (id INT)"); echo "ok"; } catch (Throwable $e) { echo $e->getMessage(); }'
+    return subprocess.run([PHP, '-d', 'error_reporting=0', '-r', code, DB_HOST['host'], str(DB_HOST['port']), user, password, database], capture_output=True, text=True).stdout.strip()
+
+
+def mails():
+    """Access lists of the "app connected" mails so far. The panel writes its mail to the log with MAIL_MAILER=log."""
+    files = sorted(glob.glob(os.path.join(INSTANCE, 'storage', 'logs', 'laravel*.log')), key=os.path.getmtime)
+    return re.findall(r'with this access: ([^\n]*)', open(files[-1], errors='replace').read()) if files else []
+
+
+def new_mail(before):
+    for _ in range(40):  # sent after the response
+        if len(mails()) > before:
+            return mails()[-1]
+        time.sleep(0.25)
 
 
 # Activity written before this run is ignored by the activity checks.
@@ -106,7 +135,7 @@ def connect(user, scopes, redirect='http://localhost:7777/cb', fresh=False):
     is signed out: /oauth/authorize sends it to /auth/login and the login answer must send it back.
     Later calls reuse that signed-in session and land on the consent page directly."""
     cid = register(redirect).json()['client_id']; v, c = pkce()
-    q = dict(response_type='code', client_id=cid, redirect_uri=redirect, code_challenge=c, code_challenge_method='S256', state='st1', scope='panel:read panel:control panel:write', resource=B + '/mcp')
+    q = dict(response_type='code', client_id=cid, redirect_uri=redirect, code_challenge=c, code_challenge_method='S256', state='st1', scope=' '.join(ALL), resource=B + '/mcp')
     s = None if fresh else SESSIONS.get(user['username'])
     intended = None
     if s is None:
@@ -155,12 +184,12 @@ def tool(tok, _tool, **args):
 print('== v2 routing: discovery, stateless machine endpoints')
 for path in ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']:
     r = requests.get(B + path); d = r.json()
-    check(f'{path}', r.status_code == 200 and d['resource'] == B + '/mcp' and d['authorization_servers'] == [B] and d['scopes_supported'] == ['panel:read', 'panel:control', 'panel:write'], r.text)
+    check(f'{path}', r.status_code == 200 and d['resource'] == B + '/mcp' and d['authorization_servers'] == [B] and d['scopes_supported'] == ALL, r.text)
 for path in ['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp']:
     r = requests.get(B + path); d = r.json()
     check(f'{path}', r.status_code == 200 and d['issuer'] == B and d['token_endpoint'] == B + '/oauth/token' and d['registration_endpoint'] == B + '/oauth/register'
           and d['revocation_endpoint'] == B + '/oauth/revoke' and d['authorization_endpoint'] == B + '/oauth/authorize' and d['code_challenge_methods_supported'] == ['S256']
-          and d['token_endpoint_auth_methods_supported'] == ['none'] and d['authorization_response_iss_parameter_supported'] is True, r.text)
+          and d['token_endpoint_auth_methods_supported'] == ['none'] and d['authorization_response_iss_parameter_supported'] is True and d['scopes_supported'] == ALL, r.text)
 r = register()
 check('register: 201, no cookie, own 20/min limit', r.status_code == 201 and 'Set-Cookie' not in r.headers and r.headers.get('X-RateLimit-Limit') == '20', dict(r.headers))
 r = requests.post(B + '/oauth/token', data={'grant_type': 'authorization_code', 'code': 'x', 'client_id': 'y'})
@@ -193,26 +222,28 @@ check('client name sanitised', '<' not in r.json()['client_name'], r.json()['cli
 r = requests.get(B + '/oauth/authorize', params=dict(client_id='nope', redirect_uri='https://x/y'), allow_redirects=False)
 check('unauthenticated authorize -> login', r.status_code == 302 and r.headers['Location'] == B + '/auth/login')
 
-print('== full flow (admin, all scopes)')
-s, cid, v, code, red, resp, _, intended = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+print('== full flow (admin, all four scopes)')
+m0 = len(mails())
+s, cid, v, code, red, resp, _, intended = connect(ADMIN, ALL)
+check('the connection mail names the fourth scope (titles are joined with semicolons: one has commas)', new_mail(m0) == 'read; control; change files and settings; manage backups, ports and databases.', mails()[-2:])
 check('login returned to the consent page (url.intended)', intended.startswith('/oauth/authorize?') and 'client_id=' + cid in intended, intended)
 check('consent redirect has no-store', resp.headers.get('Cache-Control', '').startswith('no-store'), dict(resp.headers))
 check('wrong verifier refused', token(cid, 'x' * 50, code, red).status_code == 400)
 check('code is single use after a failed attempt', token(cid, v, code, red).status_code == 400)
-s, cid, v, code, red, resp, _, intended = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+s, cid, v, code, red, resp, _, intended = connect(ADMIN, ALL)
 check('wrong client refused', token('other', v, code, red).status_code == 400)
-s, cid, v, code, red, resp, _, intended = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+s, cid, v, code, red, resp, _, intended = connect(ADMIN, ALL)
 check('wrong redirect_uri refused', token(cid, v, code, 'http://localhost:7777/other').status_code == 400)
-s, cid, v, code, red, *_ = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+s, cid, v, code, red, *_ = connect(ADMIN, ALL)
 r = token(cid, v, code, red); t = r.json()
-check('token issued', r.status_code == 200 and t['scope'] == 'panel:read panel:control panel:write' and t['token_type'] == 'Bearer' and t['expires_in'] == 3600
+check('token issued', r.status_code == 200 and t['scope'] == ' '.join(ALL) and t['token_type'] == 'Bearer' and t['expires_in'] == 3600
       and t['access_token'].startswith('lmcp_') and r.headers.get('Cache-Control', '').startswith('no-store') and r.headers.get('Pragma') == 'no-cache' and 'Set-Cookie' not in r.headers, (r.text, dict(r.headers)))
 A = t['access_token']
 stored = sql(f"SELECT COUNT(*) FROM {TP}oauth_tokens WHERE access_hash = SHA2('{A}', 256) AND refresh_hash = SHA2('{t['refresh_token']}', 256);").split()
 check('only SHA-256 hashes stored', stored[-1] == '1' and A not in sql(f'SELECT access_hash, refresh_hash FROM {TP}oauth_tokens;'), stored)
 r2 = token(cid, v, code, red); check('code replay refused', r2.status_code == 400)
 check('code replay revoked the connection', rpc(A, 'ping').status_code == 401)
-s, cid, v, code, red, *_ = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+s, cid, v, code, red, *_ = connect(ADMIN, ALL)
 t = token(cid, v, code, red).json(); A = t['access_token']
 
 print('== authorize hardening')
@@ -236,6 +267,8 @@ check('cross-site consent POST refused', r.status_code == 419, r.status_code)
 pg = s.get(B + '/oauth/authorize', params=dict(response_type='code', client_id=cid, redirect_uri=red, code_challenge='a' * 43, code_challenge_method='S256', state='dd'))
 check('consent page escapes app name, shows destination, no-store', '<b>App</b>' not in pg.text and 'Test bAppb' in pg.text and 'localhost:7777' in pg.text
       and pg.headers.get('Cache-Control', '').startswith('no-store'), pg.text[:300])
+check('consent page offers all four scopes, the new one with its own words', re.findall(r'name="scopes\[\]" value="([^"]+)"', pg.text) == ALL
+      and 'Manage backups, ports and databases' in pg.text and 'Restore, lock and delete backups' in pg.text, pg.text[:300])
 check('consent page cannot be framed', pg.headers.get('X-Frame-Options') == 'DENY', dict(pg.headers))
 rid, tk = consent_fields(pg.text)
 r = s.post(B + '/oauth/authorize', data={'rid': rid, '_token': tk, 'decision': 'deny'}, allow_redirects=False)
@@ -254,8 +287,8 @@ check('authenticated /mcp sets no cookie and has no root throttle', 'Set-Cookie'
 r = rpc(A, 'initialize', {'protocolVersion': '1999-01-01'}).json()
 check('unknown protocol version -> newest', r['result']['protocolVersion'] == '2025-11-25', r)
 check('notification -> 202', rpc(A, 'notifications/initialized', notify=True).status_code == 202)
-tools = [x['name'] for x in rpc(A, 'tools/list').json()['result']['tools']]; check(f'{33 + len(FIXTURE_TOOLS) + len(EXTRA)} tools with all scopes (admin)', len(tools) == 33 + len(FIXTURE_TOOLS) + len(EXTRA), tools)
-check('added tools listed after the built-in ones', set(tools[33:]) == set(FIXTURE_TOOLS + EXTRA) and 'Bad-Name' not in tools, tools[30:])
+tools = [x['name'] for x in rpc(A, 'tools/list').json()['result']['tools']]; check(f'{BUILTIN_TOOLS + len(FIXTURE_TOOLS) + len(EXTRA)} tools with all scopes (admin)', len(tools) == BUILTIN_TOOLS + len(FIXTURE_TOOLS) + len(EXTRA), tools)
+check('added tools listed after the built-in ones', set(tools[BUILTIN_TOOLS:]) == set(FIXTURE_TOOLS + EXTRA) and 'Bad-Name' not in tools, tools[BUILTIN_TOOLS - 3:])
 e, x = tool(A, 'list_servers'); check('an added tool cannot replace a built-in one', not e and 'hijacked' not in x, x[:100])
 e, x = tool(A, 'fixture_echo', text='hi'); check('a tool added through ProvidesTools runs', not e and x == 'echo: hi (user ' + str(ADMIN['id']) + ')', x)
 tl = rpc(A, 'tools/list').json()['result']['tools']
@@ -403,7 +436,9 @@ e, x = tool(A, 'list_schedules', server='SMP'); check('schedule gone, original k
 e, x = tool(A, 'delete_schedule', server='Hub-01', schedule_id=sid); check("another server's schedule id is not found", e and 'No schedule' in x, x)
 
 print('== binary files, archives, copy, search, wait')
-s_v, cid_v, v_v, code_v, red_v, *_ = connect(ADMIN, ['panel:read', 'panel:control', 'panel:write'])
+m0 = len(mails())
+s_v, cid_v, v_v, code_v, red_v, *_ = connect(ADMIN, THREE)
+check('a connection without the fourth scope is mailed without it', new_mail(m0) == 'read; control; change files and settings.', mails()[-2:])
 V = token(cid_v, v_v, code_v, red_v).json()['access_token']
 jar = open(JAR, 'rb').read()
 e, x = tool(V, 'get_server', server='SMP'); d = json.loads(x); check('get_server has started_at', not e and d['usage']['started_at'] and d['usage']['uptime_seconds'] == 3723, x[:400])
@@ -480,16 +515,20 @@ print('== scopes (admin, read only)')
 s2, cid2, v2, code2, red2, *_ = connect(ADMIN, [])
 t2 = token(cid2, v2, code2, red2).json(); R = t2['access_token']; check('read-only scope granted', t2['scope'] == 'panel:read', t2)
 tl = [x['name'] for x in rpc(R, 'tools/list').json()['result']['tools']]
-check('only read tools listed', tl[:13] == ['list_servers', 'get_server', 'get_console', 'list_files', 'read_file', 'list_schedules', 'get_activity', 'search_files', 'download_file', 'inspect_archive', 'wait_for_console', 'get_ops_guide', 'query_database'] and set(tl[13:]) == set(FIXTURE_TOOLS + EXTRA), tl)
+check('only read tools listed', tl[:17] == ['list_servers', 'get_server', 'get_console', 'list_files', 'read_file', 'list_schedules', 'get_activity', 'search_files', 'download_file', 'inspect_archive', 'wait_for_console', 'list_backups', 'download_backup', 'list_allocations', 'list_databases', 'get_ops_guide', 'query_database'] and set(tl[17:]) == set(FIXTURE_TOOLS + EXTRA), tl)
 e, x = tool(R, 'power_action', server='SMP', action='stop'); check('power refused without control scope', e and 'Control' in x, x)
 e, x = tool(R, 'write_file', server='SMP', path='x', content='y'); check('write refused without write scope', e and 'Change files' in x, x)
 e, x = tool(R, 'update_server_config', server='SMP', memory_mb=1); check('admin write tool refused without write scope', e and 'Change files' in x, x)
+e, x = tool(R, 'create_backup', server='Hub-01'); check('create_backup refused without control scope', e and 'Control' in x, x)
+e, x = tool(R, 'set_docker_image', server='SMP', image='Java 21'); check('set_docker_image refused without write scope', e and 'Change files' in x, x)
+e, x = tool(R, 'reinstall_server', server='SMP'); check('manage tools refused without the manage scope', e and 'Manage backups, ports and databases' in x, x)
+e, x = tool(R, 'list_backups', server='Hub-01'); check('list_backups works with the read scope', not e and 'Nightly' in x, x)
 e, x = tool(R, 'read_file', server='SMP', path='server.properties'); check('read still works', not e)
 s2b, cid2b, v2b, code2b, red2b, *_ = connect(ADMIN, ['panel:read', 'panel:write', 'bogus:scope'])
 t2b = token(cid2b, v2b, code2b, red2b).json(); check('unknown scopes dropped, read always kept', t2b['scope'] == 'panel:read panel:write', t2b)
 
 print('== panel permissions (staff subuser, all scopes)')
-s3, cid3, v3, code3, red3, *_ = connect(STAFF, ['panel:read', 'panel:control', 'panel:write'])
+s3, cid3, v3, code3, red3, *_ = connect(STAFF, ALL)
 S = token(cid3, v3, code3, red3).json()['access_token']
 e, x = tool(S, 'list_servers'); d = json.loads(x); check('staff sees only Hub-01', d['count'] == 1 and d['servers'][0]['name'] == 'Hub-01', x)
 e, x = tool(S, 'get_server', server='Secret'); check('other server invisible', e and 'No server' in x, x)
@@ -510,7 +549,7 @@ e, x = tool(S, 'send_command', server='Hub-01', command='list', wait_seconds=0);
 e, x = tool(S, 'get_console', server='Hub-01'); check('staff may read the console', not e and '> list' in x, x)
 e, x = tool(S, 'get_server', server='Hub-01'); check('staff sees own permissions, no startup/sftp', not e and 'startup_command' not in x and 'sftp' not in x and 'control.console' in x, x)
 tl3 = [x['name'] for x in rpc(S, 'tools/list').json()['result']['tools']]
-check('staff is not offered admin tools', not ({'get_ops_guide', 'query_database', 'update_server_config', *EXTRA} & set(tl3)) and 'search_files' in tl3 and len(tl3) == 30 + len(FIXTURE_TOOLS), tl3)
+check('staff is not offered admin tools', not ({'get_ops_guide', 'query_database', 'update_server_config', *EXTRA} & set(tl3)) and 'search_files' in tl3 and len(tl3) == BUILTIN_TOOLS - 3 + len(FIXTURE_TOOLS), tl3)
 for nm, kw in [('get_ops_guide', {}), *[(x, {}) for x in EXTRA], ('query_database', dict(database=GAME_DB, sql='SELECT 1')), ('update_server_config', dict(server='Hub-01', memory_mb=1))]:
     e, x = tool(S, nm, **kw); check(f'staff cannot call {nm}', e and 'Unknown tool' in x, x)
 e, x = tool(S, 'get_activity', server='Hub-01'); check('staff without activity.read refused', e and 'activity.read' in x, x)
@@ -519,6 +558,281 @@ e, x = tool(S, 'search_files', server='Hub-01', query='motd'); check('staff may 
 e, x = tool(S, 'upload_file', server='Hub-01', path='/x.bin', content_base64='AA=='); check('staff without file.create cannot upload', e and 'file.create' in x, x)
 e, x = tool(S, 'download_file', server='Hub-01', path='/server.properties'); check('staff with read-content can download', not e and 'Base64' in x, x[:80])
 e, x = tool(S, 'wait_for_console', server='Hub-01', text='never', timeout_seconds=5); check('staff may wait for the console', not e and 'Not seen' in x, x)
+
+print('== backups, ports, databases, settings: scopes')
+MANAGE = [('restore_backup', dict(backup='x')), ('delete_backup', dict(backup='x')), ('set_backup_lock', dict(backup='x', locked=True)), ('add_allocation', {}), ('update_allocation', dict(allocation='1', primary=True)),
+          ('remove_allocation', dict(allocation='1')), ('create_database', dict(name='abc')), ('rotate_database_password', dict(database='abc')), ('delete_database', dict(database='abc')), ('rename_server', dict(name='x')), ('reinstall_server', {})]
+tl_v = [x['name'] for x in rpc(V, 'tools/list').json()['result']['tools']]
+check('a connection made before panel:manage existed is not offered the 11 manage tools', len(tl_v) == BUILTIN_TOOLS - 11 + len(FIXTURE_TOOLS) + len(EXTRA) and not ({n_ for n_, _ in MANAGE} & set(tl_v))
+      and {'list_backups', 'download_backup', 'list_allocations', 'list_databases', 'create_backup', 'set_docker_image'} <= set(tl_v), tl_v)
+for nm, kw in MANAGE:
+    e, x = tool(V, nm, server='Hub-01', **kw); check(f'{nm} refused without panel:manage, naming the scope', e and '"Manage backups, ports and databases" access' in x, x)
+e, x = tool(V, 'create_backup', server='Hub-01', name='no manage', locked=True); check('create_backup with locked needs panel:manage, naming the scope', e and '"Manage backups, ports and databases" access' in x and 'without locked' in x, x)
+check('... and no backup was made', sql(f"SELECT COUNT(*) FROM backups WHERE server_id = {HUB_PK} AND name = 'no manage';").split()[-1] == '0')
+e, x = tool(V, 'list_databases', server='Hub-01', include_passwords=True); check('database passwords need panel:manage too', e and 'Manage backups, ports and databases' in x, x)
+e, x = tool(V, 'list_databases', server='Hub-01'); check('list_databases works without panel:manage', not e and json.loads(x)['databases'] == [], x)
+
+print('== backups (admin)')
+s_m, cid_m, v_m, code_m, red_m, *_ = connect(ADMIN, ALL); M = token(cid_m, v_m, code_m, red_m).json()['access_token']
+e, x = tool(M, 'get_server', server='Hub-01'); d = json.loads(x) if not e else {}
+check('get_server shows the feature limits and the Docker images on offer', not e and d['feature_limits'] == {'backups': 3, 'databases': 3, 'ports': 3} and d['docker_image'] == 'ghcr.io/pterodactyl/yolks:java_25'
+      and d['docker_image_choices'] == {'Java 21': 'ghcr.io/pterodactyl/yolks:java_21', 'Java 25': 'ghcr.io/pterodactyl/yolks:java_25'}, x[:900])
+e, x = tool(M, 'get_server', server='SMP'); d = json.loads(x) if not e else {}
+check('feature limits are 0 where the server has none', not e and d['feature_limits'] == {'backups': 0, 'databases': 0, 'ports': 0}, x[:900])
+e, x = tool(M, 'list_backups', server='Hub-01'); d = json.loads(x) if not e else {}
+check('list_backups: limit, count, newest first, finished and failed', not e and d['limit'] == 3 and d['kept'] == 1 and [b['name'] for b in d['backups']] == ['Nightly', 'Failed run']
+      and d['backups'][0]['state'] == 'completed' and d['backups'][0]['size_mb'] == 5.0 and d['backups'][0]['locked'] is False and d['backups'][1]['state'] == 'failed' and 'size_mb' not in d['backups'][1], x)
+e, x = tool(M, 'list_backups', server='SMP'); d = json.loads(x) if not e else {}
+check('list_backups on a server that may keep none', not e and d['limit'].startswith('none') and d['backups'] == [], x)
+e, x = tool(M, 'list_backups', server='nope'); check('list_backups: unknown server', e and 'No server' in x, x)
+e, x = tool(M, 'create_backup', server='Hub-01', ignore='*.log'); check('create_backup: ignore must be a list', e and 'list' in x, x)
+e, x = tool(M, 'create_backup', server='Hub-01', ignore=[1]); check('create_backup: ignore entries must be strings', e and 'list' in x, x)
+e, x = tool(M, 'create_backup', server='SMP'); check('create_backup on a server that may keep none is refused', e and 'limit of 0' in x, x)
+e, x = tool(M, 'create_backup', server='Hub-01', name='mcp first', ignore=['*.log', 'cache/']); check('create_backup starts a backup', not e and 'Started backup "mcp first"' in x and 'locked' not in x, x)
+B1 = re.search(r'id ([0-9a-f-]{36})', x).group(1)
+c = [c_ for c_ in wings_calls(HUB) if c_['path'] == '/backup']
+check('the node was asked for it with the id, the disk and the ignore list', len(c) == 1 and c[0]['method'] == 'POST' and c[0]['body'] == {'adapter': 'wings', 'uuid': B1, 'ignore': '*.log\ncache/'}, c)
+q = sql(f"SELECT GROUP_CONCAT(s.subject_type) FROM activity_logs a JOIN activity_log_subjects s ON s.activity_log_id = a.id WHERE a.id > {A0} AND a.event = 'server:backup.start' AND JSON_VALUE(a.properties, '$.name') = 'mcp first';")
+check('backup events have the server and the backup as subjects', 'server' in q.lower() and 'backup' in q.lower().replace('server:backup', ''), q)
+e, x = tool(M, 'create_backup', server='Hub-01', name='mcp locked', locked=True); check('create_backup locked', not e and 'Started backup "mcp locked"' in x and ', locked' in x, x)
+B2 = re.search(r'id ([0-9a-f-]{36})', x).group(1)
+e, x = tool(M, 'create_backup', server='Hub-01', name='mcp third'); check("the panel's two-backups-in-ten-minutes throttle applies", e and 'Only 2 backups' in x, x)
+check('... and made no backup', sql(f"SELECT COUNT(*) FROM backups WHERE server_id = {HUB_PK} AND name = 'mcp third';").split()[-1] == '0')
+e, x = tool(M, 'list_backups', server='Hub-01'); d = json.loads(x) if not e else {}; bk = {b['name']: b for b in d['backups']}
+check('new backups are in progress, the locked one is locked', not e and bk['mcp first']['state'] == 'in progress' and bk['mcp locked']['locked'] is True and bk['mcp first']['ignored'] == ['*.log', 'cache/'] and d['kept'] == 3, x)
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='mcp first'); check('an unfinished backup cannot be restored', e and 'in progress' in x, x)
+e, x = tool(M, 'download_backup', server='Hub-01', backup=B1); check('an unfinished backup cannot be downloaded', e and 'in progress' in x, x)
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='Failed run'); check('a failed backup cannot be restored', e and 'failed' in x, x)
+e, x = tool(M, 'download_backup', server='Hub-01', backup='Failed run'); check('a failed backup cannot be downloaded', e and 'failed' in x, x)
+e, x = tool(M, 'set_backup_lock', server='Hub-01', backup='Failed run', locked=True); check('a failed backup cannot be locked', e and 'nothing to lock' in x, x)
+sql(f"UPDATE backups SET is_successful = 1, completed_at = NOW(), bytes = 3145728, checksum = 'sha256:abc' WHERE uuid IN ('{B1}', '{B2}');")  # what Wings reports when it is done
+e, x = tool(M, 'list_backups', server='Hub-01'); bk = {b['name']: b for b in json.loads(x)['backups']}; check('finished backups show their size', bk['mcp first']['state'] == 'completed' and bk['mcp first']['size_mb'] == 3.0 and 'completed_at' in bk['mcp first'], x)
+e, x = tool(M, 'download_backup', server='Hub-01', backup='mcp first'); check('download_backup gives a link on the node, by name', not e and W + '/download/backup?token=' in x and '(3 MB, .tar.gz)' in x and 'valid for 15 minutes' in x, x)
+jwt = re.search(r'token=([\w-]+\.[\w-]+\.[\w-]+)', x).group(1); claims = json.loads(base64.urlsafe_b64decode(jwt.split('.')[1] + '=='))
+check('backup download token claims', claims['backup_uuid'] == B1 and claims['server_uuid'] == HUB and claims['exp'] - claims['iat'] <= 15 * 60 + 5, claims)
+for nm, kw in [('download_backup', {}), ('restore_backup', {}), ('delete_backup', {}), ('set_backup_lock', dict(locked=True))]:
+    e, x = tool(M, nm, server='Hub-01', backup='nope', **kw); check(f'{nm}: unknown backup', e and 'No backup "nope"' in x, x)
+e, x = tool(M, 'download_backup', server='SMP', backup=B1); check("another server's backup is not found", e and 'No backup' in x, x)
+e, x = tool(M, 'delete_backup', server='Hub-01', backup='mcp locked'); check('a locked backup cannot be deleted', e and 'is locked' in x and 'set_backup_lock' in x, x)
+check('... and the node was not asked to', not [c_ for c_ in wings_calls(HUB) if c_['method'] == 'DELETE'])
+e, x = tool(M, 'set_backup_lock', server='Hub-01', backup='mcp locked', locked=True); check('locking a locked backup changes nothing', not e and 'already locked' in x, x)
+e, x = tool(M, 'set_backup_lock', server='Hub-01', backup='mcp first', locked=True); check('set_backup_lock locks', not e and 'now locked' in x, x)
+e, x = tool(M, 'set_backup_lock', server='Hub-01', backup='mcp locked', locked=False); check('set_backup_lock unlocks', not e and 'now unlocked' in x, x)
+e, x = tool(M, 'set_backup_lock', server='Hub-01', backup='mcp locked', locked=False); check('unlocking an unlocked backup changes nothing', not e and 'already unlocked' in x, x)
+e, x = tool(M, 'list_backups', server='Hub-01'); bk = {b['name']: b for b in json.loads(x)['backups']}; check('lock state is visible', bk['mcp first']['locked'] is True and bk['mcp locked']['locked'] is False, x)
+e, x = tool(M, 'delete_backup', server='Hub-01', backup='mcp first'); check('a backup locked with set_backup_lock cannot be deleted', e and 'is locked' in x, x)
+e, x = tool(M, 'delete_backup', server='Hub-01', backup=B2); check('delete_backup (by id)', not e and 'Deleted backup "mcp locked"' in x, x)
+c = [c_ for c_ in wings_calls(HUB) if c_['method'] == 'DELETE']; check('the node was told to delete it', len(c) == 1 and c[0]['path'] == f'/backup/{B2}', c)
+check('the row is gone (soft deleted)', sql(f"SELECT deleted_at IS NOT NULL FROM backups WHERE uuid = '{B2}';").split()[-1] == '1')
+e, x = tool(M, 'delete_backup', server='Hub-01', backup='Failed run'); check('a failed backup can be deleted', not e and 'Deleted backup "Failed run"' in x, x)
+e, x = tool(M, 'list_backups', server='Hub-01'); d = json.loads(x); check('deleted backups are not listed', [b['name'] for b in d['backups']] == ['mcp first', 'Nightly'] and d['kept'] == 2, x)
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='mcp first'); check('restore_backup over the current files', not e and 'over the current files' in x and 'stops the server first' in x, x)
+c = [c_ for c_ in wings_calls(HUB) if c_['path'].endswith('/restore')]; check('the node was told to restore it, keeping the files', len(c) == 1 and c[0]['path'] == f'/backup/{B1}/restore' and c[0]['body']['truncate_directory'] is False and c[0]['body']['adapter'] == 'wings', c)
+check('the server is marked as restoring', sql(f"SELECT status FROM servers WHERE uuid = '{HUB}';").split()[-1] == 'restoring_backup')
+e, x = tool(M, 'get_server', server='Hub-01'); check('get_server says it is restoring', not e and json.loads(x)['state'] == 'restoring a backup', x[:200])
+e, x = tool(M, 'list_files', server='Hub-01'); check('tools are refused while it restores', e and 'restoring a backup' in x, x)
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='mcp first'); check('a second restore is refused while the first runs', e and 'restoring a backup' in x, x)
+sql(f"UPDATE servers SET status = NULL WHERE uuid = '{HUB}';")
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='Nightly', delete_existing_files=True); check('restore_backup deleting the current files first', not e and 'after deleting every current file' in x, x)
+c = [c_ for c_ in wings_calls(HUB) if c_['path'].endswith('/restore')]; check('the node was told to empty the folder first', len(c) == 2 and c[1]['body']['truncate_directory'] is True, c)
+sql(f"UPDATE servers SET status = NULL WHERE uuid = '{HUB}';")
+requests.get(W + '/_fail', params={'kind': 'restore'})
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='Nightly'); check('when the node refuses, the restore fails', e, x)
+check('... and the server is not left marked as restoring', sql(f"SELECT IFNULL(status, 'none') FROM servers WHERE uuid = '{HUB}';").split()[-1] == 'none')
+e, x = tool(M, 'restore_backup', server='Hub-01', backup='Nightly'); check("restore shares the panel's per-server limit (3 in 15 minutes)", e and 'too often' in x and 'seconds' in x, x)
+check('... and the node was not asked', len([c_ for c_ in wings_calls(HUB) if c_['path'].endswith('/restore')]) == 2)
+requests.get(W + '/_fail', params={'kind': 'backup'})
+sql(f"UPDATE servers SET backup_limit = 1 WHERE id = {SECRET_PK};")
+e, x = tool(M, 'create_backup', server=SECRET_UUID, name='doomed'); check('when the node refuses a backup, the tool fails', e, x)
+q = sql(f"SELECT is_successful, is_locked, completed_at IS NOT NULL FROM backups WHERE server_id = {SECRET_PK} AND name = 'doomed';").split()[-3:]
+check('... and the backup is recorded as failed, not left in progress', q == ['0', '0', '1'], q)
+e, x = tool(M, 'create_backup', server=SECRET_UUID, name='kept'); check('a failed backup does not use up the limit', not e and 'Started backup "kept"' in x, x)
+e, x = tool(M, 'create_backup', server=SECRET_UUID, name='over'); check("create_backup at the server's backup limit", e and 'limit of 1' in x, x)
+sql(f"UPDATE servers SET backup_limit = 0 WHERE id = {SECRET_PK};")
+
+print('== ports (admin)')
+s_m, cid_m, v_m, code_m, red_m, *_ = connect(ADMIN, ALL); M = token(cid_m, v_m, code_m, red_m).json()['access_token']
+e, x = tool(M, 'list_allocations', server='Hub-01'); d = json.loads(x) if not e else {}
+check('list_allocations: only the primary port at first', not e and d['limit'] == 3 and len(d['allocations']) == 1 and d['allocations'][0]['primary'] is True and d['allocations'][0]['port'] == 25566 and d['allocations'][0]['ip'] == '10.0.0.1'
+      and d['allocations'][0]['address'] == '10.0.0.1:25566' and 'notes' not in d['allocations'][0], x)
+PRIMARY = d['allocations'][0]['id']
+e, x = tool(M, 'list_allocations', server='SMP'); check('list_allocations on a server that may not add ports', not e and json.loads(x)['limit'].startswith('none'), x)
+e, x = tool(M, 'add_allocation', server='Hub-01', notes='x' * 257); check('add_allocation: notes over 256 characters refused', e and '256' in x, x)
+e, x = tool(M, 'add_allocation', server='Hub-01', notes='Geyser'); m_ = re.search(r'Added 10\.0\.0\.1:(\d+) \(id (\d+)\)', x)
+check('add_allocation hands out a free port of the node', not e and m_ and 19301 <= int(m_.group(1)) <= 19303, x)
+PORT1, AID1 = m_.group(1), int(m_.group(2)); ADDR1 = '10.0.0.1:' + PORT1
+e, x = tool(M, 'list_allocations', server='Hub-01'); d = json.loads(x); a1 = [a_ for a_ in d['allocations'] if a_['id'] == AID1][0]
+check('the new port is listed with its notes, not primary', a1['notes'] == 'Geyser' and a1['primary'] is False and a1['address'] == ADDR1 and len(d['allocations']) == 2, x)
+e, x = tool(M, 'get_server', server='Hub-01'); check('get_server lists it among the addresses', ADDR1 in json.loads(x)['addresses'] and '10.0.0.1:25566 (primary)' in json.loads(x)['addresses'], x[:600])
+sess = SESSIONS[ADMIN['username']]
+r = sess.post(B + f'/api/client/servers/{HUB}/network/allocations', headers=xsrf(sess))
+check("the panel's own add-port request counts against the same limit: 2 of 2 are used", r.status_code == 200 and r.headers.get('X-RateLimit-Limit') == '2' and r.headers.get('X-RateLimit-Remaining') == '0', (r.status_code, dict(r.headers), r.text[:300]))
+e, x = tool(M, 'add_allocation', server='Hub-01'); check("add_allocation shares the panel's per-server limit (2 a minute)", e and 'too often' in x and 'seconds' in x, x)
+r = sess.post(B + f'/api/client/servers/{HUB}/network/allocations', headers=xsrf(sess)); check('... and so does the panel after MCP used its share', r.status_code == 429, r.status_code)
+sql(f"UPDATE servers SET allocation_limit = 2 WHERE id = {SMP_PK};")
+e, x = tool(M, 'add_allocation', server='SMP'); m_ = re.search(r'Added 10\.0\.0\.1:(\d+) \(id (\d+)\)', x); check('add_allocation on another server', not e and m_ and 'next time the server starts' in x, x)
+SMP_AID = int(m_.group(2))
+e, x = tool(M, 'add_allocation', server='SMP'); check("add_allocation at the server's port limit", e and 'limit has been reached' in x, x)
+sql(f"UPDATE servers SET allocation_limit = 2 WHERE id = {SECRET_PK};")
+e, x = tool(M, 'add_allocation', server=SECRET_UUID); check('add_allocation with no free port left on the node', e and 'no more space' in x, x)
+sql("UPDATE settings SET value = 'false' WHERE `key` = 'settings::pterodactyl:client_features:allocations:enabled';")
+try:
+    e, x = tool(M, 'add_allocation', server=SECRET_UUID); check('add_allocation when the panel does not hand out ports', e and 'not enabled' in x, x)
+finally:
+    sql("UPDATE settings SET value = 'true' WHERE `key` = 'settings::pterodactyl:client_features:allocations:enabled';")
+sql(f"UPDATE servers SET allocation_limit = NULL WHERE id IN ({SMP_PK}, {SECRET_PK});")
+e, x = tool(M, 'remove_allocation', server='SMP', allocation=SMP_AID); check('remove_allocation refused where the server has no port limit', e and 'no allocation limit' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=AID1); check('update_allocation needs notes or primary', e and 'Pass notes' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=AID1, notes='y' * 257); check('update_allocation: notes over 256 characters refused', e and '256' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation='999999', notes='x'); check('update_allocation: unknown port', e and 'has no port "999999"' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=SMP_AID, notes='x'); check("update_allocation: another server's port is not found", e and 'has no port' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=AID1, notes='Bedrock'); check('update_allocation sets notes (by id)', not e and 'notes "Bedrock"' in x, x)
+e, x = tool(M, 'list_allocations', server='Hub-01'); check('... and they are listed', [a_ for a_ in json.loads(x)['allocations'] if a_['id'] == AID1][0]['notes'] == 'Bedrock', x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=ADDR1, notes=''); check('update_allocation clears notes (by address)', not e and 'notes cleared' in x, x)
+e, x = tool(M, 'list_allocations', server='Hub-01'); check('... and they are gone', 'notes' not in [a_ for a_ in json.loads(x)['allocations'] if a_['id'] == AID1][0], x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=AID1, primary=True); check('update_allocation makes a port primary', not e and 'now the primary port' in x, x)
+check('... in the panel', sql(f"SELECT allocation_id FROM servers WHERE id = {HUB_PK};").split()[-1] == str(AID1))
+e, x = tool(M, 'get_server', server='Hub-01'); check('get_server shows the new primary', f'{ADDR1} (primary)' in json.loads(x)['addresses'], x[:600])
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=AID1, primary=True); check('making the primary port primary again changes nothing', not e and 'already the primary' in x, x)
+e, x = tool(M, 'remove_allocation', server='Hub-01', allocation=AID1); check('the primary port cannot be removed', e and 'primary port' in x, x)
+e, x = tool(M, 'update_allocation', server='Hub-01', allocation=PRIMARY, primary=True, notes='Java'); check('update_allocation: notes and primary together', not e and 'notes "Java"' in x and 'now the primary port' in x, x)
+e, x = tool(M, 'remove_allocation', server='Hub-01', allocation='999999'); check('remove_allocation: unknown port', e and 'has no port' in x, x)
+e, x = tool(M, 'remove_allocation', server='Hub-01', allocation=ADDR1); check('remove_allocation (by address)', not e and f'Removed {ADDR1}' in x, x)
+q = sql(f"SELECT IFNULL(server_id, 'free'), IFNULL(notes, 'none') FROM allocations WHERE id = {AID1};").split()[-2:]; check('... the port is free again and its notes are cleared', q == ['free', 'none'], q)
+e, x = tool(M, 'list_allocations', server='Hub-01'); d = json.loads(x); check('removed ports are not listed', AID1 not in [a_['id'] for a_ in d['allocations']] and len(d['allocations']) == 2, x)
+
+print('== databases (admin)')
+s_m, cid_m, v_m, code_m, red_m, *_ = connect(ADMIN, ALL); M = token(cid_m, v_m, code_m, red_m).json()['access_token']
+DBN = f's{HUB_PK}_luckperms'
+e, x = tool(M, 'list_databases', server='Hub-01'); d = json.loads(x) if not e else {}; check('list_databases: none yet', not e and d['limit'] == 3 and d['databases'] == [], x)
+e, x = tool(M, 'list_databases', server='SMP'); check('list_databases on a server that may have none', not e and json.loads(x)['limit'].startswith('none'), x)
+env_file = os.path.join(INSTANCE, '.env'); env0 = open(env_file).read()
+try:  # the setting comes from the environment, which the panel reads again on every request
+    open(env_file, 'w').write(re.sub(r'^PTERODACTYL_CLIENT_DATABASES_ENABLED=.*\n?', '', env0, flags=re.M).rstrip('\n') + '\nPTERODACTYL_CLIENT_DATABASES_ENABLED=false\n')
+    e, x = tool(M, 'create_database', server=SECRET_UUID, name='nodb'); check('create_database when the panel does not let users create databases', e and 'does not let users create databases' in x, x)
+finally:
+    open(env_file, 'w').write(env0)
+e, x = tool(M, 'create_database', server='Hub-01', name='luckperms'); pw = re.search(r'^password: (.+)$', x, re.M); user = re.search(r'^username: (\S+)$', x, re.M)
+check('create_database returns the connection details', not e and f'Created database {DBN}' in x and f"host: {DB_HOST['host']}:{DB_HOST['port']}" in x and user and user.group(1).startswith(f'u{HUB_PK}_') and pw and 'connections_from: %' in x and 'do not repeat it in chat' in x, x)
+DBUSER, DBPW = user.group(1), pw.group(1)
+check('the database exists on the database host', sql(f"SHOW DATABASES LIKE '{DBN}';").split()[-1] == DBN)
+check('its user can connect and use it, with the password it was given', game_login(DBUSER, DBPW, DBN) == 'ok', game_login(DBUSER, DBPW, DBN))
+e, x = tool(M, 'create_database', server='Hub-01', name='luckperms'); check('a duplicate database name is refused', e and 'already has a database called luckperms' in x, x)
+e, x = tool(M, 'list_databases', server='Hub-01'); d = json.loads(x); db = d['databases'][0]
+check('list_databases: name, host, user, no password by default', len(d['databases']) == 1 and db['name'] == DBN and db['username'] == DBUSER and db['host'] == f"{DB_HOST['host']}:{DB_HOST['port']}" and db['connections_from'] == '%' and 'password' not in db and DBPW not in x, x)
+e, x = tool(M, 'list_databases', server='Hub-01', include_passwords=True); d = json.loads(x); check('list_databases with include_passwords', not e and d['databases'][0]['password'] == DBPW, x.replace(DBPW, '***'))
+e, x = tool(M, 'rotate_database_password', server='Hub-01', database='nope'); check('rotate_database_password: unknown database', e and 'has no database "nope"' in x, x)
+e, x = tool(M, 'delete_database', server='Hub-01', database='nope'); check('delete_database: unknown database', e and 'has no database "nope"' in x, x)
+e, x = tool(M, 'rotate_database_password', server='Hub-01', database='luckperms'); pw2 = re.search(r'^password: (.+)$', x, re.M); check('rotate_database_password (name without the prefix)', not e and pw2 and pw2.group(1) != DBPW and 'stops connecting' in x, x.replace(DBPW, '***'))
+DBPW2 = pw2.group(1)
+check('the new password works on the database host, the old one does not', game_login(DBUSER, DBPW2, DBN) == 'ok' and 'Access denied' in game_login(DBUSER, DBPW, DBN), game_login(DBUSER, DBPW, DBN))
+e, x = tool(M, 'list_databases', server='Hub-01', include_passwords=True); check('list_databases shows the new password', json.loads(x)['databases'][0]['password'] == DBPW2, '(password)')
+sql(f"UPDATE servers SET database_limit = 3 WHERE id = {SECRET_PK};")
+e, x = tool(M, 'create_database', server=SECRET_UUID, name='a;b', connections_from="%`@`x`; DROP DATABASE mysql; -- "); check('create_database: a connections_from that could break out of the statement is refused', e and 'Not accepted' in x, x)
+e, x = tool(M, 'create_database', server=SECRET_UUID, name='a b'); check('create_database: a name with a space is refused', e and 'Not accepted' in x, x)
+check('... and nothing was created on the database host', sql(f"SHOW DATABASES LIKE 's{SECRET_PK}\\_%';").split() == [])
+sql(f"UPDATE servers SET database_limit = 1 WHERE id = {SMP_PK};")
+e, x = tool(M, 'create_database', server='SMP', name='smpdb', connections_from='10.9.8.7'); user = re.search(r'^username: (\S+)$', x, re.M); pw = re.search(r'^password: (.+)$', x, re.M)
+check('create_database with connections_from', not e and 'connections_from: 10.9.8.7' in x and user and pw, x)
+check('... only that address may connect (a login from here is refused by the database host)', 'Access denied' in game_login(user.group(1), pw.group(1), f's{SMP_PK}_smpdb'), game_login(user.group(1), pw.group(1), f's{SMP_PK}_smpdb'))
+e, x = tool(M, 'create_database', server='SMP', name='second'); check("create_database at the server's database limit", e and 'limit has been reached' in x, x)
+e, x = tool(M, 'delete_database', server='SMP', database=f's{SMP_PK}_smpdb'); check('delete_database (full name)', not e and f's{SMP_PK}_smpdb' in x, x)
+sql(f"UPDATE servers SET database_limit = NULL WHERE id IN ({SMP_PK}, {SECRET_PK});")
+
+print('== Docker image, name and reinstall (admin)')
+s_m, cid_m, v_m, code_m, red_m, *_ = connect(ADMIN, ALL); M = token(cid_m, v_m, code_m, red_m).json()['access_token']
+J21, J25 = 'ghcr.io/pterodactyl/yolks:java_21', 'ghcr.io/pterodactyl/yolks:java_25'
+e, x = tool(M, 'get_server', server='SMP'); check('SMP offers both images (its image came from the list)', json.loads(x)['docker_image'] == J21 and json.loads(x)['docker_image_choices'] == {'Java 21': J21, 'Java 25': J25}, x[:700])
+e, x = tool(M, 'set_docker_image', server='SMP', image='Java 25'); check('set_docker_image by label', not e and f'now uses Java 25 ({J25}) instead of {J21}' in x and 'next time the server starts' in x, x)
+e, x = tool(M, 'get_server', server='SMP'); check('... the server uses it', json.loads(x)['docker_image'] == J25, x[:300])
+e, x = tool(M, 'set_docker_image', server='SMP', image='Java 25'); check('the image it already has changes nothing', not e and 'already uses' in x, x)
+e, x = tool(M, 'set_docker_image', server='SMP', image=J21); check('set_docker_image by image', not e and 'now uses Java 21' in x, x)
+e, x = tool(M, 'set_docker_image', server='SMP', image='ghcr.io/evil/miner:latest'); check('an image the type does not offer is refused, with the choices', e and 'must be one of' in x and 'Java 21' in x and 'Java 25' in x, x)
+e, x = tool(M, 'set_docker_image', server='SMP', image='java 21'); check('labels must match exactly', e and 'must be one of' in x, x)
+e, x = tool(M, 'update_server_config', server='SMP', docker_image='registry.example/custom:1'); check('an administrator can set any image', not e, x)
+e, x = tool(M, 'get_server', server='SMP'); check("an image outside the type's list: no choices offered", json.loads(x)['docker_image'] == 'registry.example/custom:1' and 'docker_image_choices' not in json.loads(x), x[:400])
+e, x = tool(M, 'set_docker_image', server='SMP', image='Java 21'); check('set_docker_image refused when the current image is not on the list', e and 'administrator' in x and 'update_server_config' in x, x)
+e, x = tool(M, 'get_server', server='SMP'); check('... and the image is unchanged', json.loads(x)['docker_image'] == 'registry.example/custom:1', x[:300])
+e, x = tool(M, 'update_server_config', server='SMP', docker_image=J21); check('image set back', not e, x)
+e, x = tool(M, 'rename_server', server=SECRET_UUID); check('rename_server needs a name or a description', e and 'Pass name' in x, x)
+sql(f"UPDATE servers SET external_id = 'ext-secret' WHERE id = {SECRET_PK};")
+e, x = tool(M, 'rename_server', server=SECRET_UUID, name='Secret 2', description='hidden hub'); check('rename_server: name and description', not e and '- name: "Secret" -> "Secret 2"' in x and '- description: "" -> "hidden hub"' in x, x)
+e, x = tool(M, 'get_server', server='Secret 2'); d = json.loads(x); check('... visible, and the server is found by its new name', not e and d['name'] == 'Secret 2' and d['description'] == 'hidden hub', x[:200])
+q = sql(f"SELECT owner_id, external_id FROM servers WHERE id = {SECRET_PK};").split()[-2:]; check('renaming keeps the owner and the external id', q == [str(ADMIN['id']), 'ext-secret'], q)
+e, x = tool(M, 'rename_server', server=SECRET_UUID, name='Secret 2', description='hidden hub'); check('rename_server with the same values changes nothing', not e and 'Nothing to change' in x, x)
+e, x = tool(M, 'rename_server', server=SECRET_UUID, description=''); check('an empty description clears it', not e and '- description: "hidden hub" -> ""' in x, x)
+e, x = tool(M, 'rename_server', server=SECRET_UUID, name='   '); check('a blank name is refused', e and 'Not accepted' in x, x)
+e, x = tool(M, 'rename_server', server=SECRET_UUID, name='n' * 192); check('a name over 191 characters is refused', e and 'Not accepted' in x, x)
+e, x = tool(M, 'rename_server', server=SECRET_UUID, name='Secret'); check('rename back', not e, x)
+sql(f"UPDATE servers SET external_id = NULL WHERE id = {SECRET_PK};")
+e, x = tool(M, 'reinstall_server', server=SECRET_UUID); check('reinstall_server', not e and 'Reinstalling Secret' in x and 'still installing' in x, x)
+c = wings_calls(SECRET_UUID); check('the node was told to reinstall', [c_['path'] for c_ in c if c_['path'] == '/reinstall'] == ['/reinstall'] and [c_ for c_ in c if c_['path'] == '/reinstall'][0]['method'] == 'POST', c)
+check('the server is marked as installing', sql(f"SELECT status FROM servers WHERE id = {SECRET_PK};").split()[-1] == 'installing')
+e, x = tool(M, 'get_server', server=SECRET_UUID); check('get_server says it is installing', not e and json.loads(x)['state'] == 'still installing', x[:200])
+e, x = tool(M, 'read_file', server=SECRET_UUID, path='server.properties'); check('tools are refused while it installs', e and 'still installing' in x, x)
+e, x = tool(M, 'reinstall_server', server=SECRET_UUID); check('a second reinstall is refused while it runs', e and 'still installing' in x, x)
+sql(f"UPDATE servers SET status = NULL WHERE id = {SECRET_PK};")
+requests.get(W + '/_fail', params={'kind': 'reinstall'})
+e, x = tool(M, 'reinstall_server', server=SECRET_UUID); check('when the node refuses, the reinstall fails', e, x)
+check('... and the server is not left marked as installing', sql(f"SELECT IFNULL(status, 'none') FROM servers WHERE id = {SECRET_PK};").split()[-1] == 'none')
+sql(f"UPDATE servers SET skip_scripts = 1 WHERE id = {SECRET_PK};")
+e, x = tool(M, 'reinstall_server', server=SECRET_UUID); check('a server that skips its install script cannot be reinstalled', e and 'skip' in x, x)
+sql(f"UPDATE servers SET skip_scripts = 0 WHERE id = {SECRET_PK};")
+check('... nothing was sent to the node', len([c_ for c_ in wings_calls(SECRET_UUID) if c_['path'] == '/reinstall']) == 1)
+
+print('== backups, ports, databases and settings (staff subuser)')
+STAFF_BASE = ['websocket.connect', 'file.read', 'file.read-content', 'control.console']
+
+
+def staff_can(*extra):
+    sql(f"UPDATE subusers SET permissions = '{json.dumps(STAFF_BASE + list(extra))}' WHERE server_id = {HUB_PK} AND user_id = {STAFF['id']};")
+
+
+for nm, kw, perm in [('list_backups', {}, 'backup.read'), ('download_backup', dict(backup='x'), 'backup.download'), ('list_allocations', {}, 'allocation.read'), ('list_databases', {}, 'database.read'),
+                      ('create_backup', {}, 'backup.create'), ('set_docker_image', dict(image='Java 21'), 'startup.docker-image'), ('restore_backup', dict(backup='x'), 'backup.restore'),
+                      ('delete_backup', dict(backup='x'), 'backup.delete'), ('set_backup_lock', dict(backup='x', locked=True), 'backup.delete'), ('add_allocation', {}, 'allocation.create'),
+                      ('update_allocation', dict(allocation='1', primary=True), 'allocation.update'), ('remove_allocation', dict(allocation='1'), 'allocation.delete'),
+                      ('create_database', dict(name='abc'), 'database.create'), ('rotate_database_password', dict(database='abc'), 'database.update'), ('delete_database', dict(database='abc'), 'database.delete'),
+                      ('rename_server', dict(name='x'), 'settings.rename'), ('reinstall_server', {}, 'settings.reinstall')]:
+    e, x = tool(S, nm, server='Hub-01', **kw); check(f'staff may not {nm} (no {perm})', e and f'"{perm}"' in x, x)
+e, x = tool(S, 'list_databases', server='Hub-01', include_passwords=True); check('staff without database.read cannot ask for passwords either', e and 'database.read' in x, x)
+s_sv, cid_sv, v_sv, code_sv, red_sv, *_ = connect(STAFF, THREE); SV = token(cid_sv, v_sv, code_sv, red_sv).json()['access_token']
+try:
+    staff_can('backup.read', 'backup.create', 'backup.download')
+    e, x = tool(S, 'create_backup', server='Hub-01', name='staff locked', locked=True); check('locking a new backup needs backup.delete', e and 'backup.delete' in x and 'without locked' in x, x)
+    e, x = tool(SV, 'create_backup', server='Hub-01', name='staff locked', locked=True); check('... and the scope is checked before the permission', e and '"Manage backups, ports and databases" access' in x and 'backup.delete' not in x, x)
+    check('... and no backup was made', sql(f"SELECT COUNT(*) FROM backups WHERE server_id = {HUB_PK} AND name = 'staff locked';").split()[-1] == '0')
+    e, x = tool(S, 'list_backups', server='Hub-01'); check('staff with backup.read lists backups', not e and 'mcp first' in x, x)
+    e, x = tool(S, 'download_backup', server='Hub-01', backup='Nightly'); check('staff with backup.download gets a link', not e and W + '/download/backup?token=' in x, x)
+    e, x = tool(S, 'delete_backup', server='Hub-01', backup='Nightly'); check('delete_backup still needs backup.delete', e and '"backup.delete"' in x, x)
+    staff_can('database.read', 'database.create', 'database.update', 'database.delete')
+    e, x = tool(S, 'list_databases', server='Hub-01'); check('staff with database.read lists databases, without passwords', not e and DBN in x and DBPW2 not in x and 'password' not in x, x.replace(DBPW2, '***'))
+    e, x = tool(S, 'list_databases', server='Hub-01', include_passwords=True); check('database passwords need database.view_password', e and 'database.view_password' in x, x)
+    e, x = tool(S, 'create_database', server='Hub-01', name='staffdb'); user = re.search(r'^username: (\S+)$', x, re.M)
+    check('create_database by staff: details, but no password', not e and f's{HUB_PK}_staffdb' in x and user and 'password:' not in x and 'may not view database passwords' in x, x)
+    e, x = tool(M, 'list_databases', server='Hub-01', include_passwords=True); pws = {d_['name']: d_['password'] for d_ in json.loads(x)['databases']}
+    check('... the database exists with a password only the admin can see', f's{HUB_PK}_staffdb' in pws and game_login(user.group(1), pws[f's{HUB_PK}_staffdb'], f's{HUB_PK}_staffdb') == 'ok', '(passwords)')
+    e, x = tool(M, 'create_database', server='Hub-01', name='third'); check("create_database shares the panel's per-server limit (2 a minute)", e and 'too often' in x, x)
+    e, x = tool(S, 'rotate_database_password', server='Hub-01', database='staffdb'); check('rotate_database_password by staff: no password in the answer', not e and 'password:' not in x and 'may not view database passwords' in x, x)
+    e, x = tool(M, 'list_databases', server='Hub-01', include_passwords=True); pws2 = {d_['name']: d_['password'] for d_ in json.loads(x)['databases']}
+    check('... but the password did change, and the new one works', pws2[f's{HUB_PK}_staffdb'] != pws[f's{HUB_PK}_staffdb'] and game_login(user.group(1), pws2[f's{HUB_PK}_staffdb'], f's{HUB_PK}_staffdb') == 'ok', '(passwords)')
+    staff_can('database.read', 'database.view_password', 'database.delete')
+    e, x = tool(S, 'list_databases', server='Hub-01', include_passwords=True); check('with database.view_password staff sees the passwords', not e and {d_['name']: d_['password'] for d_ in json.loads(x)['databases']} == pws2, '(passwords)')
+    e, x = tool(S, 'delete_database', server='Hub-01', database='staffdb'); check('delete_database by staff', not e, x)
+    staff_can('startup.docker-image')
+    e, x = tool(S, 'get_server', server='Hub-01'); check('staff with startup.docker-image sees the choices', not e and json.loads(x)['docker_image_choices'] == {'Java 21': J21, 'Java 25': J25}, x[:600])
+    sql(f"UPDATE servers SET image = 'registry.example/custom:1' WHERE id = {HUB_PK};")
+    e, x = tool(S, 'get_server', server='Hub-01'); check('... but not when an administrator set another image', not e and 'docker_image_choices' not in json.loads(x), x[:600])
+    e, x = tool(S, 'set_docker_image', server='Hub-01', image='Java 21'); check('set_docker_image by staff refused then; they are not told about update_server_config', e and 'only an administrator can change it' in x and 'update_server_config' not in x, x)
+    sql(f"UPDATE servers SET image = '{J25}' WHERE id = {HUB_PK};")
+    e, x = tool(S, 'set_docker_image', server='Hub-01', image='Java 21'); check('set_docker_image by staff', not e and 'now uses Java 21' in x, x)
+    sql(f"UPDATE servers SET image = '{J25}' WHERE id = {HUB_PK};")
+finally:
+    staff_can()
+e, x = tool(M, 'delete_database', server='Hub-01', database=DBN); check('delete_database (admin)', not e and DBN in x and 'all of its data' in x, x)
+check('the database and its user are gone from the database host', sql(f"SHOW DATABASES LIKE '{DBN}';").split() == [] and sql(f"SELECT COUNT(*) FROM mysql.user WHERE User = '{DBUSER}';").split()[-1] == '0')
+check('... and can no longer connect', 'Access denied' in game_login(DBUSER, DBPW2, DBN), game_login(DBUSER, DBPW2, DBN))
+e, x = tool(M, 'list_databases', server='Hub-01'); check('no databases left', not e and json.loads(x)['databases'] == [], x)
 
 print('== suspended server')
 sql(f"UPDATE servers SET status = 'suspended' WHERE uuid = '{SMP}';")
@@ -558,7 +872,11 @@ check('every message of a batch counts: 6 batches of 20 use up the minute', code
 
 print('== refresh / revoke')
 r = post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id=cid, refresh_token=t['refresh_token'])); nt = r.json()
-check('refresh works', r.status_code == 200 and nt['access_token'] != A and nt['refresh_token'] != t['refresh_token'], r.text)
+check('refresh works, scopes unchanged', r.status_code == 200 and nt['access_token'] != A and nt['refresh_token'] != t['refresh_token'] and nt['scope'] == ' '.join(ALL), r.text)
+s_o, cid_o, v_o, code_o, red_o, *_ = connect(ADMIN, THREE); to = token(cid_o, v_o, code_o, red_o).json()
+ro = post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id=cid_o, refresh_token=to['refresh_token'])).json()
+e, x = tool(ro['access_token'], 'reinstall_server', server='Hub-01')
+check('a grant made without panel:manage does not gain it when refreshed', ro['scope'] == ' '.join(THREE) and e and 'Manage backups, ports and databases' in x, (ro, x))
 check('old access token dead after refresh', rpc(A, 'ping').status_code == 401)
 r_ = rpc(nt['access_token'], 'ping'); check('new access token works', r_.status_code == 200, r_.status_code)
 check('refresh with wrong client refused', post(B + '/oauth/token', data=dict(grant_type='refresh_token', client_id='x', refresh_token=nt['refresh_token'])).status_code == 400)
@@ -569,7 +887,7 @@ check('... and the whole connection is revoked', rpc(nt['access_token'], 'ping')
 sql(f"UPDATE {TP}oauth_tokens SET access_expires_at = NOW() - INTERVAL 1 SECOND WHERE access_hash = SHA2('%s', 256);" % V)
 check('expired access token -> 401', rpc(V, 'ping').status_code == 401)
 pg = s2.get(B + '/oauth/connections'); check('connections page lists app', pg.status_code == 200 and 'Remove' in pg.text and 'Test bAppb' in pg.text and B + '/mcp' in pg.text and pg.headers.get('Cache-Control', '').startswith('no-store'))
-check('connections page shows granted access', 'Change files and settings' in pg.text and 'Read' in pg.text)
+check('connections page shows granted access, the fourth scope included', 'Change files and settings' in pg.text and 'Manage backups, ports and databases' in pg.text and 'Read' in pg.text)
 ids = re.findall(r'/oauth/connections/(\d+)/remove', pg.text); tk = re.search(r'name="_token" value="([^"]+)"', pg.text).group(1)
 pg3 = s3.get(B + '/oauth/connections'); tk3 = re.search(r'name="_token" value="([^"]+)"', pg3.text).group(1)
 s3.post(B + f'/oauth/connections/{ids[0]}/remove', data={'_token': tk3}); check("staff cannot remove admin's connection", rpc(R, 'ping').status_code == 200)
@@ -579,6 +897,7 @@ check('removed connection dead immediately', rpc(R, 'ping').status_code == 401)
 pg = s2.get(B + '/oauth/connections'); check('connections page confirms removal', 'The connection was removed.' in pg.text or 'No apps are connected' in pg.text, pg.text[:500])
 q = sql("SELECT COUNT(*) FROM activity_logs WHERE event = 'user:mcp.disconnect';").split(); check('disconnect logged', int(q[-1]) >= 1, q)
 q = sql("SELECT COUNT(*) FROM activity_logs WHERE event = 'user:mcp.connect';").split(); check('connect logged', int(q[-1]) >= 5, q)
+q = sql("SELECT COUNT(*) FROM activity_logs WHERE event = 'user:mcp.connect' AND JSON_CONTAINS(JSON_EXTRACT(properties, '$.scopes'), '\"panel:manage\"');").split(); check('the fourth scope is recorded in the connect log', int(q[-1]) >= 1, q)
 post(B + '/oauth/revoke', data={'token': S}); check('revocation endpoint', rpc(S, 'ping').status_code == 401)
 check('anonymous connections page -> login', requests.get(B + '/oauth/connections', allow_redirects=False).headers.get('Location') == B + '/auth/login')
 
@@ -611,6 +930,24 @@ for event, where, n in [('server:file.create-directory', "JSON_VALUE(properties,
                          ('server:task.create', '1', 2)]:
     q = sql(f"SELECT COUNT(*) FROM activity_logs WHERE {since} AND event = '{event}' AND {where};").split()
     check(f'{event} logged once per action', q[-1] == str(n), q)
+
+prop = lambda k, v: f"JSON_VALUE(properties, '$.{k}') = '{v}'"
+for event, where, n, actor in [('server:backup.start', prop('name', 'mcp first'), 1, ADMIN), ('server:backup.start', prop('name', 'mcp locked') + " AND properties LIKE '%\"locked\":true%'", 1, ADMIN),
+                               ('server:backup.download', prop('name', 'mcp first'), 1, ADMIN), ('server:backup.download', prop('name', 'Nightly'), 1, STAFF),
+                               ('server:backup.lock', prop('name', 'mcp first'), 1, ADMIN), ('server:backup.unlock', prop('name', 'mcp locked'), 1, ADMIN),
+                               ('server:backup.restore', prop('name', 'mcp first'), 1, ADMIN), ('server:backup.restore', prop('name', 'Nightly') + " AND properties LIKE '%\"truncate\":true%'", 1, ADMIN),
+                               ('server:backup.delete', prop('name', 'mcp locked'), 1, ADMIN), ('server:backup.delete', prop('name', 'Failed run'), 1, ADMIN),
+                               ('server:allocation.create', prop('allocation', ADDR1), 1, ADMIN), ('server:allocation.notes', prop('allocation', ADDR1), 3, ADMIN),
+                               ('server:allocation.primary', prop('allocation', ADDR1), 1, ADMIN), ('server:allocation.primary', prop('allocation', '10.0.0.1:25566'), 1, ADMIN), ('server:allocation.delete', prop('allocation', ADDR1), 1, ADMIN),
+                               ('server:database.create', prop('name', DBN), 1, ADMIN), ('server:database.create', prop('name', f's{HUB_PK}_staffdb'), 1, STAFF), ('server:database.create', prop('name', f's{SMP_PK}_smpdb'), 1, ADMIN),
+                               ('server:database.rotate-password', prop('name', DBN), 1, ADMIN), ('server:database.rotate-password', prop('name', f's{HUB_PK}_staffdb'), 1, STAFF),
+                               ('server:database.delete', prop('name', DBN), 1, ADMIN), ('server:database.delete', prop('name', f's{HUB_PK}_staffdb'), 1, STAFF), ('server:database.delete', prop('name', f's{SMP_PK}_smpdb'), 1, ADMIN),
+                               ('server:startup.image', prop('new', J25) + f" AND JSON_VALUE(properties, '$.old') = '{J21}'", 1, ADMIN),
+                               ('server:settings.rename', prop('old', 'Secret') + " AND " + prop('new', 'Secret 2'), 1, ADMIN), ('server:settings.rename', prop('old', 'Secret 2') + " AND " + prop('new', 'Secret'), 1, ADMIN),
+                               ('server:settings.description', prop('new', 'hidden hub'), 1, ADMIN), ('server:settings.description', prop('old', 'hidden hub') + " AND " + prop('new', ''), 1, ADMIN),
+                               ('server:reinstall', '1', 1, ADMIN)]:
+    q = sql(f"SELECT COUNT(*), MIN(actor_id), MAX(actor_id) FROM activity_logs WHERE {since} AND event = '{event}' AND {where};").split()
+    check(f"{event} logged once as the user ({where.split(' AND ')[0][:60]})", q[-3:] == [str(n), str(actor['id']), str(actor['id'])], q)
 
 # Checks for tools other extensions add, run in this file's context (tool(), connect(), check(), ...).
 for extra in [x for x in os.environ.get('E2E_EXTRA_CHECKS', '').split(os.pathsep) if x]:

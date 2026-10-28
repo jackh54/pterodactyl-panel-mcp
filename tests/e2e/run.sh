@@ -12,6 +12,7 @@ export PANEL_DB=${PANEL_DB:-panel}
 export MYSQL_ROOT=${MYSQL_ROOT:-mariadb -h127.0.0.1 -P3306 -uroot}
 export MYSQL_CMD="$MYSQL_ROOT $PANEL_DB"
 export PHP=${PHP:-php}
+export MCP_SQL_PORT=${MCP_SQL_PORT:-3306}
 export PANEL_MCP_TABLE_PREFIX=${PANEL_MCP_TABLE_PREFIX:-ext_panel_mcp_}
 case "$PANEL_URL" in http://127.0.0.1:*|http://localhost:*) ;; *) echo "refusing: PANEL_URL must be a local instance" >&2; exit 2;; esac
 art() { (cd "$PANEL_DIR" && $PHP -d error_reporting=0 artisan "$@"); }
@@ -31,7 +32,7 @@ fi
 $MYSQL_ROOT < "$here/fixtures/sqldb.sql"
 env_set() { grep -q "^$1=" "$PANEL_DIR/.env" && sed -i.bak "s#^$1=.*#$1=$2#" "$PANEL_DIR/.env" || echo "$1=$2" >> "$PANEL_DIR/.env"; rm -f "$PANEL_DIR/.env.bak"; }
 env_set PANEL_MCP_SQL_HOST 127.0.0.1
-env_set PANEL_MCP_SQL_PORT "${MCP_SQL_PORT:-3306}"
+env_set PANEL_MCP_SQL_PORT "$MCP_SQL_PORT"
 env_set PANEL_MCP_SQL_USERNAME mcp_ro
 env_set PANEL_MCP_SQL_PASSWORD mcp-ro-test-only
 env_set PANEL_MCP_SQL_DATABASES mcp_game

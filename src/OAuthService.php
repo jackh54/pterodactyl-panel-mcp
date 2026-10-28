@@ -35,18 +35,26 @@ class OAuthService
 
     public const SCOPE_WRITE = 'panel:write';
 
+    // Added in 1.1. Its own scope so connections approved earlier do not gain these tools without
+    // the user agreeing to them.
+    public const SCOPE_MANAGE = 'panel:manage';
+
     public const SCOPES = [
         self::SCOPE_READ => [
             'title' => 'Read',
-            'detail' => 'See your servers, their status and resource use, read the console, files and activity. Root administrators also get the operations guide and, when configured, read-only database queries.',
+            'detail' => 'See your servers, their status and resource use, read the console, files, backups, ports, databases and activity. Root administrators also get the operations guide and, when configured, read-only database queries.',
         ],
         self::SCOPE_CONTROL => [
             'title' => 'Control',
-            'detail' => 'Start, stop, restart and kill servers, send console commands and run schedules.',
+            'detail' => 'Start, stop, restart and kill servers, send console commands, run schedules and take backups.',
         ],
         self::SCOPE_WRITE => [
             'title' => 'Change files and settings',
-            'detail' => 'Create, edit, rename, delete, archive and download-to-server files. Change startup settings and schedules.',
+            'detail' => 'Create, edit, rename, delete, archive and download-to-server files. Change startup settings, the Docker image and schedules.',
+        ],
+        self::SCOPE_MANAGE => [
+            'title' => 'Manage backups, ports and databases',
+            'detail' => 'Restore, lock and delete backups, add and remove ports, create and delete databases and see their passwords, rename servers and reinstall them.',
         ],
     ];
 

@@ -15,7 +15,7 @@ namespace PanelMcp\Contracts;
  * Each tool is an array:
  *
  *     'my_tool' => [
- *         'scope'       => 'panel:read',          // panel:read, panel:control or panel:write
+ *         'scope'       => 'panel:read',          // panel:read, panel:control, panel:write or panel:manage
  *         'title'       => 'Short title',
  *         'description' => 'What it does and when to use it.',
  *         'properties'  => ['server' => ['type' => 'string']],   // JSON Schema properties
@@ -27,7 +27,7 @@ namespace PanelMcp\Contracts;
  *
  * Your tool does its own permission checks: the MCP server only checks the scope and the admin flag.
  * Throw \PanelMcp\ToolException with a message to report an error to the client.
- * Built-in tool names always win over added ones.
+ * Built-in tool names win over added ones, except a built-in this panel build cannot offer.
  */
 interface ProvidesTools
 {

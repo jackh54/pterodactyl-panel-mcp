@@ -254,7 +254,8 @@ final class OAuthController
     {
         $email = $user->email;
         $userId = $user->id;
-        $access = implode(', ', array_map(fn ($s) => strtolower(OAuthService::SCOPES[$s]['title']), $scopes));
+        // Semicolons: a scope title can contain commas ("Manage backups, ports and databases").
+        $access = implode('; ', array_map(fn ($s) => strtolower(OAuthService::SCOPES[$s]['title']), $scopes));
         $url = $this->oauth->issuer().'/oauth/connections';
 
         $panel = (string) config('app.name', 'Pterodactyl');

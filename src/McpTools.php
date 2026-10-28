@@ -7,13 +7,27 @@ use Cron\CronExpression;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Crypt;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use PanelMcp\Contracts\ProvidesTools;
+use Pterodactyl\Contracts\Allocations\AssignsAllocations;
+use Pterodactyl\Contracts\Allocations\SetsPrimaryAllocations;
+use Pterodactyl\Contracts\Allocations\UnassignsAllocations;
+use Pterodactyl\Contracts\Allocations\UpdatesAllocationNotes;
+use Pterodactyl\Contracts\Backups\DeletesBackups;
+use Pterodactyl\Contracts\Backups\GeneratesBackupDownloadLinks;
+use Pterodactyl\Contracts\Backups\InitiatesBackups;
+use Pterodactyl\Contracts\Backups\RestoresBackups;
+use Pterodactyl\Contracts\Backups\TogglesBackupLocks;
+use Pterodactyl\Contracts\Databases\DeletesDatabases;
+use Pterodactyl\Contracts\Databases\DeploysServerDatabases;
+use Pterodactyl\Contracts\Databases\RotatesDatabasePasswords;
 use Pterodactyl\Contracts\Files\CompressesFiles;
 use Pterodactyl\Contracts\Files\CopiesFiles;
 use Pterodactyl\Contracts\Files\CreatesDirectories;
@@ -32,12 +46,16 @@ use Pterodactyl\Contracts\Schedules\ProcessesSchedules;
 use Pterodactyl\Contracts\Schedules\UpdatesSchedules;
 use Pterodactyl\Contracts\Schedules\UpdatesScheduleTasks;
 use Pterodactyl\Contracts\Servers\ReadsServerLogs;
+use Pterodactyl\Contracts\Servers\ReinstallsServers;
 use Pterodactyl\Contracts\Servers\SendsServerCommands;
 use Pterodactyl\Contracts\Servers\SendsServerPower;
 use Pterodactyl\Contracts\Servers\UpdatesServerBuild;
+use Pterodactyl\Contracts\Servers\UpdatesServerDetails;
+use Pterodactyl\Contracts\Servers\UpdatesServerDockerImage;
 use Pterodactyl\Contracts\Servers\UpdatesServerStartup;
 use Pterodactyl\Enum\JwtScope;
 use Pterodactyl\Enum\Permissions;
+use Pterodactyl\Enum\ResourceLimit;
 use Pterodactyl\Events\ActivityLogged;
 use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Exceptions\Http\Connection\DaemonConnectionException;
@@ -46,12 +64,16 @@ use Pterodactyl\Exceptions\Http\Server\ServerStateConflictException;
 use Pterodactyl\Facades\Daemon;
 use Pterodactyl\Facades\LogTarget;
 use Pterodactyl\Models\ActivityLog;
+use Pterodactyl\Models\Allocation;
+use Pterodactyl\Models\Backup;
+use Pterodactyl\Models\Database;
 use Pterodactyl\Models\EggVariable;
 use Pterodactyl\Models\Schedule;
 use Pterodactyl\Models\Server;
 use Pterodactyl\Models\Task;
 use Pterodactyl\Models\User;
 use Pterodactyl\Services\Activity\ActivityLogService;
+use Pterodactyl\Support\DatabaseName;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
 /**
@@ -65,6 +87,10 @@ use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
  * Server work goes through the panel's action contracts (Pterodactyl\Contracts\*), so anything
  * that wraps those actions sees MCP calls too. Most of those actions log activity themselves;
  * see log() for how this class avoids a second entry.
+ *
+ * The backup, port, database and settings tools resolve their action when they run instead of
+ * taking it in the constructor, and a tool whose action this panel build lacks is not listed
+ * ("requires" in catalog()). An older 2.0 build then loses those tools, not the whole server.
  */
 class McpTools
 {
@@ -272,7 +298,7 @@ class McpTools
                     'name' => $s->name,
                     'description' => $s->description ?: null,
                     'state' => $this->blockedReason($s) ?? ($live[$s->uuid]['state'] ?? 'unknown'),
-                    'address' => $s->allocation ? ($s->allocation->ip_alias ?: $s->allocation->ip).':'.$s->allocation->port : null,
+                    'address' => $s->allocation ? $this->address($s->allocation) : null,
                     'cpu_percent' => $u ? round((float) Arr::get($u, 'cpu_absolute', 0), 1) : null,
                     'memory_mb' => $u ? (int) round(Arr::get($u, 'memory_bytes', 0) / 1048576) : null,
                     'memory_limit_mb' => $s->memory ?: 'unlimited',
@@ -314,8 +340,14 @@ class McpTools
             ],
             'type' => $server->egg?->name,
             'docker_image' => $server->image,
-            'addresses' => $server->allocations->map(fn ($a) => ($a->ip_alias ?: $a->ip).':'.$a->port
+            'addresses' => $server->allocations->map(fn (Allocation $a) => $this->address($a)
                 .($a->id === $server->allocation_id ? ' (primary)' : ''))->values()->all(),
+            // 0 means none, as in the panel.
+            'feature_limits' => [
+                'backups' => (int) $server->backup_limit,
+                'databases' => (int) $server->database_limit,
+                'ports' => (int) $server->allocation_limit,
+            ],
             'your_permissions' => $this->permissions($server),
         ];
 
@@ -323,6 +355,10 @@ class McpTools
             $out['startup_command'] = $server->startup;
             $out['startup_variables'] = $server->variables->where('user_viewable', true)
                 ->mapWithKeys(fn (EggVariable $v) => [$v->env_variable => $v->server_value ?? $v->default_value])->all();
+        }
+
+        if ($this->can(Permissions::StartupDockerImage, $server) && ($choices = $this->imageChoices($server)) !== null) {
+            $out['docker_image_choices'] = $choices;
         }
 
         if ($this->can(Permissions::FileSftp, $server)) {
@@ -1186,6 +1222,502 @@ class McpTools
         return $schedule;
     }
 
+    private function setDockerImage(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::StartupDockerImage);
+        $choices = $this->imageChoices($server);
+        if ($choices === null) {
+            throw new ToolException("{$server->name}'s Docker image was set by an administrator, so only an administrator can change it"
+                .($this->user->root_admin ? ' (update_server_config).' : '.'));
+        }
+
+        // A label ("Java 21") or the image itself.
+        $wanted = trim($this->text($args, 'image'));
+        $label = array_key_exists($wanted, $choices) ? $wanted : array_search($wanted, $choices, true);
+        if ($label === false) {
+            $list = implode(', ', array_map(fn ($l, $i) => "{$l} ({$i})", array_keys($choices), $choices));
+            throw new ToolException("image must be one of: {$list}");
+        }
+
+        $image = $choices[$label];
+        $old = $server->image;
+        if ($image === $old) {
+            return "{$server->name} already uses {$label} ({$image}).";
+        }
+
+        app(UpdatesServerDockerImage::class)->update($server, $image);
+        $this->log($server, 'server:startup.image', ['old' => $old, 'new' => $image]);
+
+        return "{$server->name} now uses {$label} ({$image}) instead of {$old}. It applies the next time the server starts.";
+    }
+
+    /**
+     * The images a server's egg offers (label => image), or null when an administrator set an
+     * image outside that list, which the panel then lets only administrators change.
+     *
+     * @return array<string, string>|null
+     */
+    private function imageChoices(Server $server): ?array
+    {
+        $choices = (array) ($server->egg?->docker_images ?? []);
+
+        return in_array($server->image, $choices, true) ? $choices : null;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Backups
+    // ---------------------------------------------------------------------------------------
+
+    private function listBackups(array $args): array
+    {
+        $server = $this->server($args['server'], Permissions::BackupRead);
+        $backups = $server->backups()->orderByDesc('created_at')->get();
+
+        return [
+            'limit' => $server->backup_limit ?: 'none (this server may not keep backups)',
+            'kept' => $backups->filter(fn (Backup $b) => $this->backupState($b) !== 'failed')->count(),
+            'backups' => $backups->map(fn (Backup $b) => array_filter([
+                'id' => $b->uuid,
+                'name' => $b->name,
+                'state' => $this->backupState($b),
+                'locked' => (bool) $b->is_locked,
+                'size_mb' => $this->backupState($b) === 'completed' ? round($b->bytes / 1048576, 1) : null,
+                'created_at' => $b->created_at?->toAtomString(),
+                'completed_at' => $b->completed_at?->toAtomString(),
+                'ignored' => $b->ignored_files ?: null,
+            ], fn ($v) => $v !== null))->values()->all(),
+        ];
+    }
+
+    private function createBackup(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::BackupCreate);
+
+        $ignore = $args['ignore'] ?? [];
+        if (! is_array($ignore) || ! array_is_list($ignore) || array_filter($ignore, fn ($f) => ! is_string($f)) !== []) {
+            throw new ToolException('ignore must be a list of file or folder patterns.');
+        }
+
+        // As in the panel: only someone who may delete backups may lock one, or anyone could fill
+        // the server with backups nobody can remove.
+        // Locking also needs the Manage scope, which alone can unlock: a Control-only connection
+        // could otherwise fill every backup slot with backups it cannot remove.
+        $locked = $this->bool($args, 'locked');
+        if ($locked && ! in_array(OAuthService::SCOPE_MANAGE, $this->grant->scopes, true)) {
+            $title = OAuthService::SCOPES[OAuthService::SCOPE_MANAGE]['title'];
+            throw new ToolException("Locking a backup needs a connection given \"{$title}\" access. Try again without locked.");
+        }
+        if ($locked && ! $this->can(Permissions::BackupDelete, $server)) {
+            throw new ToolException("Locking a backup needs the \"backup.delete\" permission on {$server->name}. Try again without locked.");
+        }
+
+        $name = trim($this->text($args, 'name'));
+        $backup = app(InitiatesBackups::class)
+            ->setIgnoredFiles($ignore)
+            ->setIsLocked($locked)
+            ->initiate($server, $name !== '' ? $name : null);
+        $this->log($server, 'server:backup.start', ['name' => $backup->name, 'locked' => (bool) $backup->is_locked], $backup);
+
+        return "Started backup \"{$backup->name}\" (id {$backup->uuid}) of {$server->name}".($backup->is_locked ? ', locked' : '')
+            .'. The node makes it in the background; list_backups shows when it has finished.';
+    }
+
+    private function restoreBackup(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::BackupRestore);
+        $backup = $this->backup($server, $args['backup']);
+        if (($state = $this->backupState($backup)) !== 'completed') {
+            throw new ToolException("Backup \"{$backup->name}\" is {$state}, so it cannot be restored.");
+        }
+
+        $truncate = $this->bool($args, 'delete_existing_files');
+        $this->throttle($server, ResourceLimit::Backup);
+        app(RestoresBackups::class)->restore($server, $backup, $this->user, $truncate);
+        $this->log($server, 'server:backup.restore', ['name' => $backup->name, 'truncate' => $truncate], $backup);
+        $this->forgetState($server);
+
+        return "Restoring backup \"{$backup->name}\" on {$server->name}".($truncate ? ' after deleting every current file' : ' over the current files')
+            .'. The node stops the server first and leaves it stopped. get_server shows "restoring a backup" until it is done; then start it with power_action.';
+    }
+
+    private function deleteBackup(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::BackupDelete);
+        $backup = $this->backup($server, $args['backup']);
+        if ($backup->is_locked && $this->backupState($backup) === 'completed') {
+            throw new ToolException("Backup \"{$backup->name}\" is locked. Unlock it with set_backup_lock first.");
+        }
+
+        app(DeletesBackups::class)->delete($backup);
+        $this->log($server, 'server:backup.delete', ['name' => $backup->name, 'failed' => $this->backupState($backup) === 'failed'], $backup);
+
+        return "Deleted backup \"{$backup->name}\" of {$server->name}.";
+    }
+
+    private function setBackupLock(array $args): string
+    {
+        // The panel asks for the delete permission to lock or unlock.
+        $server = $this->server($args['server'], Permissions::BackupDelete);
+        $backup = $this->backup($server, $args['backup']);
+        $locked = $this->bool($args, 'locked');
+        if ((bool) $backup->is_locked === $locked) {
+            return "Backup \"{$backup->name}\" is already ".($locked ? 'locked' : 'unlocked').'.';
+        }
+        if ($locked && $this->backupState($backup) === 'failed') {
+            throw new ToolException("Backup \"{$backup->name}\" failed, so there is nothing to lock.");
+        }
+
+        app(TogglesBackupLocks::class)->toggle($backup);
+        $this->log($server, $locked ? 'server:backup.lock' : 'server:backup.unlock', ['name' => $backup->name], $backup);
+
+        return "Backup \"{$backup->name}\" of {$server->name} is now ".($locked ? 'locked: it cannot be deleted until it is unlocked.' : 'unlocked.');
+    }
+
+    private function downloadBackup(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::BackupDownload);
+        $backup = $this->backup($server, $args['backup']);
+        if (($state = $this->backupState($backup)) !== 'completed') {
+            throw new ToolException("Backup \"{$backup->name}\" is {$state}, so there is nothing to download.");
+        }
+
+        $url = app(GeneratesBackupDownloadLinks::class)->generate($backup, $this->user);
+        $this->log($server, 'server:backup.download', ['name' => $backup->name], $backup);
+
+        // Wings links last 15 minutes, S3 ones 5 (GenerateBackupDownloadLink).
+        $minutes = $backup->disk === Backup::ADAPTER_AWS_S3 ? 5 : 15;
+
+        return "Download link for backup \"{$backup->name}\" of {$server->name} (".round($backup->bytes / 1048576, 1)." MB, .tar.gz), valid for {$minutes} minutes. "
+            ."Anyone holding it can download the backup until then, so give it only to the user.\n\n{$url}";
+    }
+
+    /**
+     * One of the server's backups, by id (UUID) or exact name.
+     */
+    private function backup(Server $server, mixed $ref): Backup
+    {
+        $ref = trim(is_scalar($ref) ? (string) $ref : '');
+        $matches = $server->backups()->where('uuid', $ref)->get();
+        if ($matches->isEmpty()) {
+            $matches = $server->backups()->where('name', $ref)->get();
+        }
+
+        if ($matches->isEmpty()) {
+            throw new ToolException("No backup \"{$ref}\" on {$server->name}. Use list_backups.");
+        }
+        if ($matches->count() > 1) {
+            throw new ToolException("More than one backup is named \"{$ref}\". Pass its id from list_backups instead.");
+        }
+
+        return $matches->first();
+    }
+
+    private function backupState(Backup $backup): string
+    {
+        return match (true) {
+            $backup->completed_at === null => 'in progress',
+            (bool) $backup->is_successful => 'completed',
+            default => 'failed',
+        };
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Network
+    // ---------------------------------------------------------------------------------------
+
+    private function listAllocations(array $args): array
+    {
+        $server = $this->server($args['server'], Permissions::AllocationRead);
+
+        return [
+            'limit' => $server->allocation_limit ?: 'none (ports cannot be added or removed here)',
+            'allocations' => $server->allocations()->orderBy('port')->get()->map(fn (Allocation $a) => array_filter([
+                'id' => $a->id,
+                'address' => $this->address($a),
+                'ip' => $a->ip,
+                'port' => $a->port,
+                'notes' => $a->notes,
+                'primary' => $a->id === $server->allocation_id,
+            ], fn ($v) => $v !== null))->values()->all(),
+        ];
+    }
+
+    private function addAllocation(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::AllocationCreate);
+        $notes = $this->notes($args);
+
+        $this->throttle($server, ResourceLimit::Allocation);
+        $allocation = app(AssignsAllocations::class)->assign($server);
+        $this->log($server, 'server:allocation.create', ['allocation' => $allocation->toString()], $allocation);
+        if ($notes !== null) {
+            app(UpdatesAllocationNotes::class)->update($allocation, $notes);
+        }
+
+        return "Added {$this->address($allocation)} (id {$allocation->id}) to {$server->name}. "
+            .'The node opens it the next time the server starts, and the game or plugin must be set to listen on that port.';
+    }
+
+    private function updateAllocation(array $args): string
+    {
+        $primary = $this->bool($args, 'primary');
+        if (! array_key_exists('notes', $args) && ! $primary) {
+            throw new ToolException('Pass notes, primary: true, or both.');
+        }
+
+        $server = $this->server($args['server'], Permissions::AllocationUpdate);
+        $allocation = $this->allocation($server, $args['allocation']);
+        $address = $this->address($allocation);
+        $done = [];
+
+        if (array_key_exists('notes', $args)) {
+            $notes = $this->notes($args);
+            if ($notes !== $allocation->notes) {
+                $old = $allocation->notes;
+                app(UpdatesAllocationNotes::class)->update($allocation, $notes);
+                $this->log($server, 'server:allocation.notes', ['allocation' => $allocation->toString(), 'old' => $old, 'new' => $notes], $allocation);
+            }
+            $done[] = $notes === null ? 'notes cleared' : "notes \"{$notes}\"";
+        }
+
+        if ($primary) {
+            if ($allocation->id === $server->allocation_id) {
+                $done[] = 'already the primary port';
+            } else {
+                app(SetsPrimaryAllocations::class)->setPrimary($server, $allocation);
+                $this->log($server, 'server:allocation.primary', ['allocation' => $allocation->toString()], $allocation);
+                $done[] = 'now the primary port (players connect here after the next start)';
+            }
+        }
+
+        return "{$address} on {$server->name}: ".implode('; ', $done).'.';
+    }
+
+    private function removeAllocation(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::AllocationDelete);
+        $allocation = $this->allocation($server, $args['allocation']);
+        $address = $this->address($allocation);
+        if ($allocation->id === $server->allocation_id) {
+            throw new ToolException("{$address} is the primary port of {$server->name}. Make another port primary first.");
+        }
+
+        app(UnassignsAllocations::class)->unassign($server, $allocation);
+        $this->log($server, 'server:allocation.delete', ['allocation' => $allocation->toString()], $allocation);
+
+        return "Removed {$address} from {$server->name}. The node closes it the next time the server starts.";
+    }
+
+    /**
+     * One of the server's allocations, by id or address ("ip:port", or the alias and port).
+     */
+    private function allocation(Server $server, mixed $ref): Allocation
+    {
+        $ref = trim(is_scalar($ref) ? (string) $ref : '');
+        $allocation = $server->allocations()->get()
+            ->first(fn (Allocation $a) => (string) $a->id === $ref || $a->toString() === $ref || $this->address($a) === $ref);
+
+        return $allocation ?? throw new ToolException("{$server->name} has no port \"{$ref}\". Use list_allocations and pass its id.");
+    }
+
+    private function address(Allocation $allocation): string
+    {
+        return ($allocation->ip_alias ?: $allocation->ip).':'.$allocation->port;
+    }
+
+    /**
+     * The notes argument: null when absent or blank (which clears them), at most 256 characters
+     * as in the panel.
+     */
+    private function notes(array $args): ?string
+    {
+        $notes = trim($this->text($args, 'notes'));
+        if (mb_strlen($notes) > 256) {
+            throw new ToolException('notes may be at most 256 characters.');
+        }
+
+        return $notes === '' ? null : $notes;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Databases
+    // ---------------------------------------------------------------------------------------
+
+    private function listDatabases(array $args): array
+    {
+        $server = $this->server($args['server'], Permissions::DatabaseRead);
+        $passwords = $this->bool($args, 'include_passwords');
+        if ($passwords) {
+            if (! in_array(OAuthService::SCOPE_MANAGE, $this->grant->scopes, true)) {
+                $title = OAuthService::SCOPES[OAuthService::SCOPE_MANAGE]['title'];
+                throw new ToolException("Passwords are only shown to connections given \"{$title}\" access. Ask again without include_passwords.");
+            }
+            if (! $this->can(Permissions::DatabaseViewPassword, $server)) {
+                throw new ToolException("Your panel account does not have the \"database.view_password\" permission on {$server->name}.");
+            }
+        }
+
+        return [
+            'limit' => $server->database_limit ?: 'none (this server may not have databases)',
+            'databases' => $server->databases()->with('host')->get()
+                ->map(fn (Database $d) => $this->databaseDetails($d, $passwords))->values()->all(),
+        ];
+    }
+
+    private function createDatabase(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::DatabaseCreate);
+        // The action's own refusal is not a DisplayException, so it would surface as an internal error.
+        if (! config('pterodactyl.client_features.databases.enabled')) {
+            throw new ToolException('This panel does not let users create databases.');
+        }
+        $name = trim($this->text($args, 'name'));
+        // The panel checks this in its request, before the action, so the database server is never asked.
+        if ($server->databases()->where('database', DatabaseName::generateUnique($name, $server->id))->exists()) {
+            throw new ToolException("{$server->name} already has a database called {$name}.");
+        }
+
+        $this->throttle($server, ResourceLimit::Database);
+        $database = app(DeploysServerDatabases::class)->deploy($server, [
+            'database' => $name,
+            'remote' => trim($this->text($args, 'connections_from', '%')),
+        ]);
+        $this->log($server, 'server:database.create', ['name' => $database->database], $database);
+
+        return "Created database {$database->database} for {$server->name}.\n".$this->databaseText($server, $database);
+    }
+
+    private function rotateDatabasePassword(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::DatabaseUpdate);
+        $database = $this->database($server, $args['database']);
+
+        app(RotatesDatabasePasswords::class)->rotate($database);
+        $this->log($server, 'server:database.rotate-password', ['name' => $database->database], $database);
+
+        return "New password for {$database->database} on {$server->name}. Anything still using the old one stops connecting until its config is updated.\n"
+            .$this->databaseText($server, $database->refresh());
+    }
+
+    private function deleteDatabase(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::DatabaseDelete);
+        $database = $this->database($server, $args['database']);
+
+        app(DeletesDatabases::class)->delete($database);
+        $this->log($server, 'server:database.delete', ['name' => $database->database], $database);
+
+        return "Deleted database {$database->database} of {$server->name}, its user and all of its data.";
+    }
+
+    /**
+     * One of the server's databases, by its full name or the name it was created with (the panel
+     * adds an "s<server id>_" prefix).
+     */
+    private function database(Server $server, mixed $ref): Database
+    {
+        $ref = trim(is_scalar($ref) ? (string) $ref : '');
+        $database = $server->databases()->where('database', $ref)->first()
+            ?? $server->databases()->where('database', DatabaseName::generateUnique($ref, $server->id))->first();
+
+        return $database ?? throw new ToolException("{$server->name} has no database \"{$ref}\". Use list_databases.");
+    }
+
+    private function databaseDetails(Database $database, bool $password): array
+    {
+        $database->loadMissing('host');
+
+        return array_filter([
+            'name' => $database->database,
+            'host' => $database->host->host.':'.$database->host->port,
+            'username' => $database->username,
+            'password' => $password ? Crypt::decrypt($database->password) : null,
+            'connections_from' => $database->remote,
+            'max_connections' => $database->max_connections ?: null,
+        ], fn ($v) => $v !== null);
+    }
+
+    /**
+     * Connection details after a create or rotate. The password is left out, as in the panel, for
+     * accounts without database.view_password.
+     */
+    private function databaseText(Server $server, Database $database): string
+    {
+        $show = $this->can(Permissions::DatabaseViewPassword, $server);
+        $text = '';
+        foreach ($this->databaseDetails($database, $show) as $key => $value) {
+            $text .= "{$key}: {$value}\n";
+        }
+
+        return $text.($show
+            ? "\nThe password is meant for the config that uses this database: write it there, do not repeat it in chat."
+            : "\nYour account may not view database passwords on this server, so it is not shown.");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Server settings
+    // ---------------------------------------------------------------------------------------
+
+    private function renameServer(array $args): string
+    {
+        if (! array_key_exists('name', $args) && ! array_key_exists('description', $args)) {
+            throw new ToolException('Pass name, description, or both.');
+        }
+
+        $server = $this->server($args['server'], Permissions::SettingsRename);
+        $old = ['name' => $server->name, 'description' => (string) $server->description];
+        $new = [
+            'name' => array_key_exists('name', $args) ? trim($this->text($args, 'name')) : $old['name'],
+            'description' => array_key_exists('description', $args) ? trim($this->text($args, 'description')) : $old['description'],
+        ];
+        if ($new === $old) {
+            return "Nothing to change on {$server->name}: the values given are already in place.";
+        }
+
+        // The action replaces the owner and external id too, so the current ones are passed along.
+        $server = app(UpdatesServerDetails::class)->update($server, [
+            'external_id' => $server->external_id,
+            'owner_id' => $server->owner_id,
+            ...$new,
+        ]);
+
+        $lines = [];
+        foreach (['name' => 'server:settings.rename', 'description' => 'server:settings.description'] as $field => $event) {
+            if ($new[$field] !== $old[$field]) {
+                $this->log($server, $event, ['old' => $old[$field], 'new' => $new[$field]]);
+                $lines[] = "- {$field}: \"{$old[$field]}\" -> \"{$new[$field]}\"";
+            }
+        }
+
+        return "Updated {$server->name}:\n".implode("\n", $lines);
+    }
+
+    private function reinstallServer(array $args): string
+    {
+        $server = $this->server($args['server'], Permissions::SettingsReinstall);
+
+        app(ReinstallsServers::class)->reinstall($server);
+        $this->log($server, 'server:reinstall');
+        $this->forgetState($server);
+
+        return "Reinstalling {$server->name}: the node stops it and runs its install script again. "
+            .'get_server shows "still installing" until the script has finished; then start it with power_action.';
+    }
+
+    /**
+     * The panel's per-server limit on a resource, counted in the bucket its client API uses (the
+     * key Laravel's ThrottleRequests gives a named limiter), so the panel and MCP share one allowance.
+     */
+    private function throttle(Server $server, ResourceLimit $resource): void
+    {
+        $limit = $resource->limit();
+        $key = md5($resource->throttleKey().$server->uuid);
+        if (RateLimiter::tooManyAttempts($key, $limit->maxAttempts)) {
+            throw new ToolException("That was done too often on {$server->name} just now. Try again in ".RateLimiter::availableIn($key).' seconds.');
+        }
+        RateLimiter::hit($key, $limit->decaySeconds);
+    }
+
     // ---------------------------------------------------------------------------------------
     // Binary files, archives and waiting for the console
     // ---------------------------------------------------------------------------------------
@@ -1814,8 +2346,12 @@ class McpTools
         $read = OAuthService::SCOPE_READ;
         $control = OAuthService::SCOPE_CONTROL;
         $write = OAuthService::SCOPE_WRITE;
+        $manage = OAuthService::SCOPE_MANAGE;
+        $backup = ['type' => 'string', 'description' => 'Backup id from list_backups, or its exact name.'];
+        $allocation = ['type' => 'string', 'description' => 'Port id from list_allocations, or its address (ip:port).'];
+        $database = ['type' => 'string', 'description' => 'Database name from list_databases (the s<number>_ prefix may be left out).'];
 
-        return [
+        $tools = [
             'list_servers' => [
                 'scope' => $read, 'handler' => 'listServers', 'title' => 'List servers',
                 'description' => 'Lists the servers this account can access, with live state (running, offline, starting, stopping), CPU and memory. Start here to get server ids.',
@@ -1926,6 +2462,34 @@ class McpTools
                 ],
                 'required' => ['server', 'text'],
             ],
+            'list_backups' => [
+                'scope' => $read, 'handler' => 'listBackups', 'title' => 'List backups',
+                'description' => 'Lists a server\'s backups, newest first: id, name, whether it finished, failed or is still running, size and lock, and how many the server may keep.',
+                'properties' => ['server' => $server],
+                'required' => ['server'],
+            ],
+            'download_backup' => [
+                'scope' => $read, 'handler' => 'downloadBackup', 'title' => 'Backup download link', 'requires' => GeneratesBackupDownloadLinks::class,
+                'description' => 'A link, valid for a few minutes, to download a finished backup as a .tar.gz. Anyone holding the link can download the backup, so give it only to the user.',
+                'properties' => ['server' => $server, 'backup' => $backup],
+                'required' => ['server', 'backup'],
+            ],
+            'list_allocations' => [
+                'scope' => $read, 'handler' => 'listAllocations', 'title' => 'List ports',
+                'description' => 'Lists a server\'s network ports (allocations): id, address, notes, which one is primary (the address players use), and how many it may have.',
+                'properties' => ['server' => $server],
+                'required' => ['server'],
+            ],
+            'list_databases' => [
+                'scope' => $read, 'handler' => 'listDatabases', 'title' => 'List databases',
+                'description' => 'Lists a server\'s MySQL/MariaDB databases: name, host, username, where connections may come from, and how many the server may have.',
+                'properties' => [
+                    'server' => $server,
+                    'include_passwords' => ['type' => 'boolean', 'description' => 'Also return the passwords (default false). Needs "Manage backups, ports and databases" access and the database.view_password permission. Only ask for them to write into a config.'],
+                ],
+                'required' => ['server'],
+            ],
+
             'power_action' => [
                 'scope' => $control, 'handler' => 'powerAction', 'title' => 'Power action', 'destructive' => true,
                 'description' => 'Starts, stops, restarts or kills a server. stop and restart disconnect everyone on it; kill ends the process without saving and can lose data, so use it only when stop has failed. Confirm with the user before stop, restart or kill on a server with players.',
@@ -1953,6 +2517,18 @@ class McpTools
                     'schedule_id' => ['type' => 'integer', 'description' => 'Schedule id from list_schedules.'],
                 ],
                 'required' => ['server', 'schedule_id'],
+            ],
+
+            'create_backup' => [
+                'scope' => $control, 'handler' => 'createBackup', 'title' => 'Create backup', 'requires' => InitiatesBackups::class,
+                'description' => 'Starts a backup of a server\'s files. It runs in the background on the node; list_backups shows when it has finished. Refused when the server already keeps as many backups as it may: ask the user before deleting an old one to make room.',
+                'properties' => [
+                    'server' => $server,
+                    'name' => ['type' => 'string', 'description' => 'Default "Backup at <date and time>".'],
+                    'locked' => ['type' => 'boolean', 'description' => 'Protect it from deletion until it is unlocked (needs "Manage backups, ports and databases" access and the backup.delete permission). Default false.'],
+                    'ignore' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'Files or folders to leave out, one pattern each (wildcards work; a leading ! keeps a match). Default: the patterns in the server\'s .pteroignore file, if it has one.'],
+                ],
+                'required' => ['server'],
             ],
 
             'edit_file' => [
@@ -2072,6 +2648,15 @@ class McpTools
                 ],
                 'required' => ['server', 'key'],
             ],
+            'set_docker_image' => [
+                'scope' => $write, 'handler' => 'setDockerImage', 'title' => 'Change Docker image', 'destructive' => true, 'requires' => UpdatesServerDockerImage::class,
+                'description' => 'Switches a server to another Docker image its type offers, for example a newer Java version for Minecraft. get_server lists them as docker_image_choices. Applies the next time the server starts; a server whose software needs the old image will not start.',
+                'properties' => [
+                    'server' => $server,
+                    'image' => ['type' => 'string', 'description' => 'A label from docker_image_choices (e.g. "Java 21"), or the image itself.'],
+                ],
+                'required' => ['server', 'image'],
+            ],
             'update_server_config' => [
                 'scope' => $write, 'admin' => true, 'handler' => 'updateServerConfig', 'title' => 'Change limits or startup command', 'destructive' => true,
                 'description' => 'Root admins only. Changes a server\'s memory, CPU or disk limit, its startup command, or its Docker image, and tells the node. Only the fields you pass change. Limits apply at once; the startup command and image apply at the next start. A mistake in the startup command (for example a mistyped JVM flag) stops the server from booting, so show the user the exact old and new command and get a yes first. Keep the container memory limit comfortably above the JVM heap.',
@@ -2128,7 +2713,99 @@ class McpTools
                 'properties' => ['server' => $server, 'schedule_id' => ['type' => 'integer'], 'task_id' => ['type' => 'integer']],
                 'required' => ['server', 'schedule_id', 'task_id'],
             ],
-        ] + $this->admin->catalog() + $this->addedTools();
+
+            'restore_backup' => [
+                'scope' => $manage, 'handler' => 'restoreBackup', 'title' => 'Restore backup', 'destructive' => true, 'requires' => RestoresBackups::class,
+                'description' => 'Restores a finished backup. The node stops the server first (everyone on it is disconnected) and leaves it stopped. By default the backup is unpacked over the current files, so files made since the backup stay; delete_existing_files deletes every current file first. Get the user\'s yes first, and offer a backup of the current state before restoring.',
+                'properties' => [
+                    'server' => $server,
+                    'backup' => $backup,
+                    'delete_existing_files' => ['type' => 'boolean', 'description' => 'Delete all of the server\'s files before restoring (default false).'],
+                ],
+                'required' => ['server', 'backup'],
+            ],
+            'delete_backup' => [
+                'scope' => $manage, 'handler' => 'deleteBackup', 'title' => 'Delete backup', 'destructive' => true, 'requires' => DeletesBackups::class,
+                'description' => 'Deletes a backup for good. A locked backup must be unlocked with set_backup_lock first.',
+                'properties' => ['server' => $server, 'backup' => $backup],
+                'required' => ['server', 'backup'],
+            ],
+            'set_backup_lock' => [
+                'scope' => $manage, 'handler' => 'setBackupLock', 'title' => 'Lock or unlock backup', 'destructive' => true, 'requires' => TogglesBackupLocks::class,
+                'description' => 'Locks a backup so it cannot be deleted, or unlocks it.',
+                'properties' => ['server' => $server, 'backup' => $backup, 'locked' => ['type' => 'boolean']],
+                'required' => ['server', 'backup', 'locked'],
+            ],
+            'add_allocation' => [
+                'scope' => $manage, 'handler' => 'addAllocation', 'title' => 'Add port', 'requires' => AssignsAllocations::class,
+                'description' => 'Gives a server one more port, picked by the panel from the free ports on its node (you cannot choose the number). Refused when the server has as many ports as it may, or the panel does not hand out ports automatically. The node opens it at the next start.',
+                'properties' => [
+                    'server' => $server,
+                    'notes' => ['type' => 'string', 'description' => 'What the port is for, e.g. "Geyser" (at most 256 characters).'],
+                ],
+                'required' => ['server'],
+            ],
+            'update_allocation' => [
+                'scope' => $manage, 'handler' => 'updateAllocation', 'title' => 'Change port', 'destructive' => true, 'requires' => SetsPrimaryAllocations::class,
+                'description' => 'Sets a port\'s notes, or makes it the primary port (the address players connect to, from the next start).',
+                'properties' => [
+                    'server' => $server,
+                    'allocation' => $allocation,
+                    'notes' => ['type' => 'string', 'description' => 'New notes; an empty string clears them.'],
+                    'primary' => ['type' => 'boolean', 'description' => 'true makes this the primary port.'],
+                ],
+                'required' => ['server', 'allocation'],
+            ],
+            'remove_allocation' => [
+                'scope' => $manage, 'handler' => 'removeAllocation', 'title' => 'Remove port', 'destructive' => true, 'requires' => UnassignsAllocations::class,
+                'description' => 'Takes a port away from a server. The primary port cannot be removed.',
+                'properties' => ['server' => $server, 'allocation' => $allocation],
+                'required' => ['server', 'allocation'],
+            ],
+            'create_database' => [
+                'scope' => $manage, 'handler' => 'createDatabase', 'title' => 'Create database', 'requires' => DeploysServerDatabases::class,
+                'description' => 'Creates a MySQL/MariaDB database and user for a server (for plugins such as LuckPerms) and returns the host, database name, username and password to put in the plugin\'s config. The panel adds an s<number>_ prefix to the name.',
+                'properties' => [
+                    'server' => $server,
+                    'name' => ['type' => 'string', 'description' => '3 to 48 letters, digits, dashes or underscores, e.g. "luckperms".'],
+                    'connections_from' => ['type' => 'string', 'description' => 'Where the user may connect from: "%" for anywhere (default), or an IP address.'],
+                ],
+                'required' => ['server', 'name'],
+            ],
+            'rotate_database_password' => [
+                'scope' => $manage, 'handler' => 'rotateDatabasePassword', 'title' => 'New database password', 'destructive' => true, 'requires' => RotatesDatabasePasswords::class,
+                'description' => 'Gives a database user a new random password and returns it. Anything still using the old password stops connecting until its config is updated.',
+                'properties' => ['server' => $server, 'database' => $database],
+                'required' => ['server', 'database'],
+            ],
+            'delete_database' => [
+                'scope' => $manage, 'handler' => 'deleteDatabase', 'title' => 'Delete database', 'destructive' => true, 'requires' => DeletesDatabases::class,
+                'description' => 'Deletes a database and its user with all of the data in it. This cannot be undone.',
+                'properties' => ['server' => $server, 'database' => $database],
+                'required' => ['server', 'database'],
+            ],
+            'rename_server' => [
+                'scope' => $manage, 'handler' => 'renameServer', 'title' => 'Rename server', 'destructive' => true, 'requires' => UpdatesServerDetails::class,
+                'description' => 'Changes a server\'s name or description as shown in the panel. Only the fields you pass change.',
+                'properties' => [
+                    'server' => $server,
+                    'name' => ['type' => 'string'],
+                    'description' => ['type' => 'string', 'description' => 'An empty string clears it.'],
+                ],
+                'required' => ['server'],
+            ],
+            'reinstall_server' => [
+                'scope' => $manage, 'handler' => 'reinstallServer', 'title' => 'Reinstall server', 'destructive' => true, 'requires' => ReinstallsServers::class,
+                'description' => 'Stops a server and runs its install script again, as when it was created. The script can delete or replace files (often the server jar), so get the user\'s yes and offer a backup first.',
+                'properties' => ['server' => $server],
+                'required' => ['server'],
+            ],
+        ];
+
+        // A tool whose panel action this build lacks (an older 2.0 release) is left out.
+        $tools = array_filter($tools, fn (array $t) => ! isset($t['requires']) || interface_exists($t['requires']));
+
+        return $tools + $this->admin->catalog() + $this->addedTools();
     }
 
     /**

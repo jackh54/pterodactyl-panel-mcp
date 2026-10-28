@@ -15,3 +15,14 @@ INSERT INTO mcp_game.bans (id, name, ip, blob_col)
 DROP USER IF EXISTS 'mcp_ro'@'%';
 CREATE USER 'mcp_ro'@'%' IDENTIFIED BY 'mcp-ro-test-only';
 GRANT SELECT ON mcp_game.* TO 'mcp_ro'@'%';
+
+-- The account of the fixture database host (seed.php: "mcp-test-dbhost"), which the panel uses for
+-- create_database, rotate_database_password and delete_database. It may only create what the panel
+-- names s<server id>_<name>; the SELECT on one help table lets it open the "mysql" schema, which the
+-- panel connects to first. (Pattern s%_% because GRANT refuses to hand out a privilege held through a
+-- pattern written with an escaped underscore.)
+DROP USER IF EXISTS 'mcp_dbhost'@'%';
+CREATE USER 'mcp_dbhost'@'%' IDENTIFIED BY 'mcp-dbhost-test-only';
+GRANT CREATE USER, RELOAD ON *.* TO 'mcp_dbhost'@'%';
+GRANT SELECT ON mysql.help_topic TO 'mcp_dbhost'@'%';
+GRANT ALL PRIVILEGES ON `s%_%`.* TO 'mcp_dbhost'@'%' WITH GRANT OPTION;

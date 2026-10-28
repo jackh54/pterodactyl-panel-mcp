@@ -11,6 +11,8 @@ from urllib.parse import urlparse, parse_qs
 FS = {}      # uuid -> {path: bytes}
 LOG = {}     # uuid -> [console lines]
 STATE = {}
+CALLS = []   # backup and reinstall requests the panel made: {server, method, path, body}
+FAIL = set() # kinds (backup, restore, delete, reinstall) whose next request answers 500
 SERVERS = sys.argv[1:]
 NOT_FOUND = {'error': 'The requested resource was not found on the system'}
 
@@ -64,7 +66,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == '/_rotate':
             fs(q['server'])['/logs/latest.log'] = b''; LOG[q['server']] = []; return self.out(204)
         if u.path == '/_reset':
-            FS.clear(); LOG.clear(); STATE.clear(); return self.out(204)
+            FS.clear(); LOG.clear(); STATE.clear(); CALLS.clear(); FAIL.clear(); return self.out(204)
+        if u.path == '/_calls':
+            return self.out(200, [c for c in CALLS if c['server'] == q['server']])
+        if u.path == '/_fail':
+            FAIL.add(q['kind']); return self.out(204)
 
         if u.path == '/api/servers' and self.command == 'GET':
             return self.out(200, [{'state': STATE.get(k, 'running'), 'is_suspended': False, 'utilization': utilization(60000), 'configuration': {'uuid': k}} for k in SERVERS])
@@ -144,6 +150,14 @@ class H(BaseHTTPRequestHandler):
             f[body['root'].rstrip('/') + '/' + name] = b'pulled'; return self.out(204)
         if rest in ('/files/decompress', '/sync'):
             return self.out(204)
+        # Backups and reinstall: Wings answers 202 and works in the background; the test finishes them in the panel's database.
+        mb = re.match(r'^/(backup|reinstall)(?:/([0-9a-f-]{36})(/restore)?)?$', rest)
+        if mb:
+            kind = 'reinstall' if mb.group(1) == 'reinstall' else 'backup' if not mb.group(2) else 'restore' if mb.group(3) else 'delete'
+            if kind in FAIL:
+                FAIL.discard(kind); return self.out(500, {'error': 'fake wings was told to fail this ' + kind})
+            CALLS.append({'server': sid, 'method': self.command, 'path': rest, 'body': body})
+            return self.out(204 if kind == 'delete' else 202)
         return self.out(404, NOT_FOUND)
 
     do_GET = do_POST = do_PUT = do_DELETE = do
