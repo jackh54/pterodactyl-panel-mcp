@@ -18,7 +18,7 @@ jobs:
       matrix:
         php: ['8.3', '8.4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
@@ -26,17 +26,35 @@ jobs:
       - name: php -l every file
         run: find . -name '*.php' -not -path './node_modules/*' -print0 | xargs -0 -n1 php -l > /dev/null
 
-  frontend:
-    name: Build, typecheck and test against upstream 2.0-develop
+  upstream:
+    name: Panel classes still exist upstream (2.0-develop)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           repository: pterodactyl/panel
           ref: 2.0-develop
           path: .panel
-      - uses: actions/setup-node@v4
+          sparse-checkout: app
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: none
+      - name: Every Pterodactyl class, interface and enum the extension names
+        run: php tests/upstream-classes.php .panel
+
+  frontend:
+    name: Build, typecheck and test against upstream 2.0-develop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: pterodactyl/panel
+          ref: 2.0-develop
+          path: .panel
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - name: Pack the panel's SDK
@@ -55,7 +73,7 @@ jobs:
       - run: npm run build
       - run: npx tsc
       - run: npm test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
